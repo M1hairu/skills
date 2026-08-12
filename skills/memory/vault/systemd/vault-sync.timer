@@ -1,0 +1,12 @@
+[Unit]
+Description=Синхронизировать vault каждые полчаса
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+# Разброс, чтобы две машины не приходили в репозиторий в одну секунду.
+RandomizedDelaySec=90
+Persistent=true
+
+[Install]
+WantedBy=timers.target

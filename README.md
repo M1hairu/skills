@@ -58,7 +58,8 @@ cd ~/Documents/skills
 ```
 
 Скиллы приезжают read-only копией и обновляются вместе с репозиторием. Команды `afk`,
-`stayawake`, `vps-afk` плагин в `$PATH` не кладёт — если нужны они, ставь симлинками.
+`stayawake`, `vps-afk`, `vault-sync` плагин в `$PATH` не кладёт — если нужны они, ставь
+симлинками.
 
 </details>
 
@@ -78,6 +79,13 @@ cd ~/Documents/skills
 - **[vps-afk](./skills/autonomy/vps-afk/SKILL.md)** — вынести работу на сервер и отпустить ноутбук:
   код через git, секреты по rsync мимо него, прогон под `systemd-run`, утром `git pull`.
   [Подробнее](./docs/autonomy/vps-afk.md), [настройка](./skills/autonomy/vps-afk/SETUP.md).
+
+### memory
+
+- **[vault](./skills/memory/vault/SKILL.md)** — хранилище знаний в `~/vault`: связные заметки
+  о проектах, системах и людях, которые человек открывает в Obsidian; общие с сервером через
+  приватный git, синхронизация командой `vault-sync` и хуками сессии.
+  [Подробнее](./docs/memory/vault.md), [настройка](./skills/memory/vault/SETUP.md).
 
 ## Как это устроено
 

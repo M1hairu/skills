@@ -1,7 +1,7 @@
 {
   "name": "m1x-skills",
-  "version": "0.1.0",
-  "description": "Скиллы для автономной работы Claude Code: перевести сессию в режим AFK на ноутбуке или вынести работу на сервер, пока человека нет.",
+  "version": "0.2.0",
+  "description": "Скиллы Claude Code: автономная работа, пока человека нет (на ноутбуке или на сервере), и хранилище знаний, общее между машинами.",
   "author": {
     "name": "m1x",
     "url": "https://github.com/M1hairu"
@@ -14,10 +14,14 @@
     "autonomy",
     "unattended",
     "vps",
-    "claude-code"
+    "claude-code",
+    "memory",
+    "obsidian",
+    "knowledge-base"
   ],
   "skills": [
     "./skills/autonomy/afk",
-    "./skills/autonomy/vps-afk"
+    "./skills/autonomy/vps-afk",
+    "./skills/memory/vault"
   ]
 }

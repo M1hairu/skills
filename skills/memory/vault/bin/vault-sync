@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Синхронизировать хранилище знаний с общим git-репозиторием.
+#
+#   vault-sync            — подтянуть чужое, отправить своё (обычный режим)
+#   vault-sync --pull     — только подтянуть (начало сессии)
+#   vault-sync --push     — только закоммитить и отправить (конец сессии)
+#   vault-sync --status   — что не отправлено и насколько отстал от remote
+#   vault-sync --quiet    — молчать, если делать нечего (для хуков и таймеров)
+#
+# Хранилище и его адрес берутся из ~/.config/claude-skills/vault.env,
+# см. SETUP.md рядом со скиллом.
+
+set -euo pipefail
+
+CONFIG="${VAULT_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-skills/vault.env}"
+if [[ -f "$CONFIG" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+fi
+
+VAULT="${VAULT_DIR:-$HOME/vault}"
+BRANCH="${VAULT_BRANCH:-main}"
+NAME="${VAULT_GIT_NAME:-$(git config --global user.name || echo vault)}"
+EMAIL="${VAULT_GIT_EMAIL:-$(git config --global user.email || echo vault@localhost)}"
+HOSTLABEL="${VAULT_HOST_LABEL:-$(hostname -s 2>/dev/null || echo host)}"
+
+MODE=both
+QUIET=0
+for a in "$@"; do
+  case "$a" in
+    --pull)   MODE=pull ;;
+    --push)   MODE=push ;;
+    --status) MODE=status ;;
+    --quiet)  QUIET=1 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "vault-sync: неизвестный флаг $a" >&2; exit 2 ;;
+  esac
+done
+
+say() { [[ "$QUIET" == 1 ]] || echo "$@"; }
+die() { echo "vault-sync: $*" >&2; exit 1; }
+
+[[ -d "$VAULT/.git" ]] || die "нет git-репозитория в $VAULT (задай VAULT_DIR в $CONFIG)"
+
+git_v() { git -C "$VAULT" "$@"; }
+
+# Два процесса (хук сессии и таймер) легко встречаются на одном репозитории.
+# flock ждёт до 60 с и выходит молча, если так и не дождался: пропущенный прогон
+# не страшен, следующий подберёт.
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/vault-sync.lock"
+if [[ "${VAULT_SYNC_LOCKED:-}" != 1 ]]; then
+  export VAULT_SYNC_LOCKED=1
+  exec flock -w 60 "$LOCK" "$0" "$@"
+fi
+
+if [[ "$MODE" == status ]]; then
+  git_v fetch -q origin "$BRANCH" 2>/dev/null || true
+  echo "хранилище: $VAULT (ветка $(git_v rev-parse --abbrev-ref HEAD))"
+  local_changes=$(git_v status --porcelain | wc -l)
+  echo "не закоммичено файлов: $local_changes"
+  git_v status --porcelain | head -20
+  behind=$(git_v rev-list --count "HEAD..origin/$BRANCH" 2>/dev/null || echo "?")
+  ahead=$(git_v rev-list --count "origin/$BRANCH..HEAD" 2>/dev/null || echo "?")
+  echo "отстаёт от remote на $behind коммит(ов), опережает на $ahead"
+  exit 0
+fi
+
+# --- подтянуть -------------------------------------------------------------
+# --autostash: незакоммиченная правка не должна мешать pull, она вернётся сверху.
+if [[ "$MODE" == pull || "$MODE" == both ]]; then
+  if git_v pull -q --rebase --autostash origin "$BRANCH" 2>/dev/null; then
+    say "подтянуто из origin/$BRANCH"
+  else
+    # Конфликт правки одного файла с двух машин. Чинить молча нельзя — это знание,
+    # а не файл сборки: оставляем как есть и говорим человеку.
+    if git_v status --porcelain | grep -q '^UU\|^AA'; then
+      git_v rebase --abort 2>/dev/null || true
+      die "конфликт при слиянии — правили один файл с двух машин.
+    Разбери руками: git -C $VAULT pull --rebase origin $BRANCH"
+    fi
+    say "pull не прошёл (сеть?) — работаю с локальной копией"
+  fi
+fi
+
+# --- отправить -------------------------------------------------------------
+if [[ "$MODE" == push || "$MODE" == both ]]; then
+  if [[ -z "$(git_v status --porcelain)" ]]; then
+    say "изменений нет"
+  else
+    files=$(git_v status --porcelain | wc -l)
+    git_v add -A
+    git_v -c user.name="$NAME" -c user.email="$EMAIL" \
+      commit -qm "vault: правки с $HOSTLABEL ($files файл(ов))"
+    say "закоммичено файлов: $files"
+  fi
+
+  # push отдельно от коммита: коммит мог остаться с прошлого прогона без сети.
+  if [[ "$(git_v rev-list --count "origin/$BRANCH..HEAD" 2>/dev/null || echo 0)" != "0" ]]; then
+    if git_v push -q origin "$BRANCH" 2>/dev/null; then
+      say "отправлено в origin/$BRANCH"
+    else
+      echo "vault-sync: push не прошёл (сеть или разошлись ветки) — коммиты целы, попробуй позже" >&2
+    fi
+  fi
+fi

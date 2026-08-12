@@ -1,0 +1,12 @@
+[Unit]
+Description=Синхронизация хранилища знаний vault
+Documentation=file:%h/skills/vault/SKILL.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Тихий режим: таймер срабатывает часто, а сказать чаще всего нечего.
+ExecStart=%h/.local/bin/vault-sync --quiet
+# Сеть на сервере отваливается — неудачный прогон не должен светиться как поломка,
+# следующий через полчаса подберёт.
+SuccessExitStatus=0 1
