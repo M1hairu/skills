@@ -1,0 +1,22 @@
+{
+  "name": "m1hairu",
+  "owner": {
+    "name": "m1x",
+    "url": "https://github.com/M1hairu"
+  },
+  "description": "Скиллы m1x для Claude Code, устанавливаемые как плагин.",
+  "plugins": [
+    {
+      "name": "m1x-skills",
+      "source": "./",
+      "description": "Автономная работа, когда человека нет за компьютером: AFK-режим на ноутбуке и вынос работы на VPS.",
+      "category": "productivity",
+      "keywords": [
+        "afk",
+        "autonomy",
+        "unattended",
+        "vps"
+      ]
+    }
+  ]
+}

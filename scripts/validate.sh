@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Проверка скиллов репозитория: фронтматтер, скрипты, следы личных данных.
+# Проверка репозитория: фронтматтер скиллов, скрипты, инварианты, следы личных данных.
 #
-#   ./scripts/validate.sh          — проверить все скиллы
-#   ./scripts/validate.sh afk      — проверить один
+#   ./scripts/validate.sh          — проверить всё
+#   ./scripts/validate.sh afk      — проверить один скилл
 #
 # Ошибка (✗) валит проверку, замечание (!) — нет.
 
@@ -10,6 +10,7 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SKILLS_DIR="$REPO/skills"
+PLUGIN="$REPO/.claude-plugin/plugin.json"
 
 c_err=$'\033[31m'; c_warn=$'\033[33m'; c_ok=$'\033[32m'; c_off=$'\033[0m'
 [[ -t 1 ]] || { c_err=""; c_warn=""; c_ok=""; c_off=""; }
@@ -21,7 +22,7 @@ warn() { printf '  %s!%s %s\n' "$c_warn" "$c_off" "$*"; warnings=$((warnings + 1
 
 # Личное, чему в публичном репозитории не место.
 scan_secrets() {
-  local file="$1" rel="${1#$REPO/}" hits
+  local file="$1" rel="${1#"$REPO"/}" hits
 
   hits=$(grep -nE '(-----BEGIN [A-Z ]*PRIVATE KEY|gh[pousr]_[A-Za-z0-9]{30,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|[0-9]{8,10}:[A-Za-z0-9_-]{35})' "$file" 2>/dev/null | head -3)
   [[ -n "$hits" ]] && err "$rel: похоже на ключ или токен — $(head -1 <<< "$hits" | cut -c1-70)"
@@ -39,9 +40,10 @@ scan_secrets() {
   [[ -n "$hits" ]] && warn "$rel: путь с именем пользователя (строка ${hits%%:*}) — используй \$HOME"
 }
 
+# rel — «категория/имя»
 check_skill() {
-  local name="$1" dir="$SKILLS_DIR/$1"
-  printf '%s\n' "$name"
+  local rel="$1" dir="$SKILLS_DIR/$1" name="${1##*/}" category="${1%%/*}"
+  printf '%s\n' "$rel"
 
   local skill="$dir/SKILL.md"
   if [[ ! -f "$skill" ]]; then
@@ -98,6 +100,23 @@ check_skill() {
     done
   fi
 
+  # ── инварианты: где скилл обязан быть упомянут ──
+  local entry="./skills/$rel"
+  if [[ "$category" == "deprecated" ]]; then
+    grep -qF "\"$entry\"" "$PLUGIN" 2>/dev/null && err "выведенный скилл остался в plugin.json"
+    [[ -f "$REPO/docs/$rel.md" ]] && err "выведенный скилл сохранил страницу docs/$rel.md"
+    grep -qF "skills/$rel/SKILL.md" "$REPO/README.md" 2>/dev/null && err "выведенный скилл остался в README.md"
+  else
+    grep -qF "\"$entry\"" "$PLUGIN" 2>/dev/null \
+      || err "нет записи в .claude-plugin/plugin.json — поставившие плагином скилл не получат"
+    [[ -f "$REPO/docs/$rel.md" ]] \
+      || err "нет страницы docs/$rel.md (см. .agents/writing-docs.md)"
+    grep -qF "skills/$rel/SKILL.md" "$REPO/README.md" 2>/dev/null \
+      || err "не упомянут в README.md"
+    grep -qsF "$name/SKILL.md" "$SKILLS_DIR/$category/README.md" \
+      || err "не упомянут в skills/$category/README.md"
+  fi
+
   # ── личные данные ──
   while IFS= read -r f; do scan_secrets "$f"; done < <(find "$dir" -type f \
       \( -name '*.md' -o -name '*.sh' -o -path '*/bin/*' \) ! -name '*.example*')
@@ -105,15 +124,65 @@ check_skill() {
   printf '\n'
 }
 
-mapfile -t ALL < <(for d in "$SKILLS_DIR"/*/; do [[ -d "$d" ]] && basename "$d"; done)
+# ── общее по репозиторию ──
+check_repo() {
+  printf 'репозиторий\n'
 
-TARGETS=("${@:-}")
-[[ -z "${TARGETS[0]:-}" ]] && TARGETS=("${ALL[@]}")
+  [[ -f "$REPO/install.sh" && -x "$REPO/install.sh" ]] || err "install.sh отсутствует или не исполняемый"
+
+  local j
+  for j in "$PLUGIN" "$REPO/.claude-plugin/marketplace.json"; do
+    if [[ -f "$j" ]]; then
+      python3 -m json.tool "$j" >/dev/null 2>&1 || err "${j#"$REPO"/}: битый JSON"
+    else
+      err "нет ${j#"$REPO"/}"
+    fi
+  done
+
+  # Обратная сторона инварианта: в plugin.json нет записей без скилла.
+  if [[ -f "$PLUGIN" ]]; then
+    local entry
+    while IFS= read -r entry; do
+      [[ -f "$REPO/${entry#./}/SKILL.md" ]] \
+        || err "plugin.json ссылается на несуществующий скилл: $entry"
+    done < <(python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1], encoding="utf-8"))["skills"]))' "$PLUGIN" 2>/dev/null)
+  fi
+
+  # Категория без README — скиллы в ней негде перечислить.
+  local d
+  for d in "$SKILLS_DIR"/*/; do
+    [[ -d "$d" ]] || continue
+    [[ "$(basename "$d")" == "deprecated" ]] && continue
+    [[ -f "$d/README.md" ]] || err "нет skills/$(basename "$d")/README.md"
+  done
+
+  local f
+  for f in "$REPO"/*.md "$REPO"/scripts/*.sh "$REPO"/install.sh; do
+    [[ -f "$f" ]] && scan_secrets "$f"
+  done
+
+  printf '\n'
+}
+
+mapfile -t ALL < <(
+  find "$SKILLS_DIR" -name SKILL.md -print0 2>/dev/null \
+    | while IFS= read -r -d '' f; do d="$(dirname "$f")"; printf '%s\n' "${d#"$SKILLS_DIR"/}"; done | sort
+)
+
+TARGETS=()
+if [[ $# -gt 0 ]]; then
+  for w in "$@"; do
+    for s in "${ALL[@]}"; do
+      [[ "$s" == "$w" || "${s##*/}" == "$w" ]] && TARGETS+=("$s")
+    done
+  done
+  [[ ${#TARGETS[@]} -gt 0 ]] || { echo "validate: нет такого скилла — $*" >&2; exit 1; }
+else
+  TARGETS=("${ALL[@]}")
+  check_repo
+fi
 
 for s in "${TARGETS[@]}"; do check_skill "$s"; done
-
-# ── общее по репозиторию ──
-[[ -f "$REPO/install.sh" && -x "$REPO/install.sh" ]] || err "install.sh отсутствует или не исполняемый"
 
 if (( errors )); then
   printf '%sошибок: %d%s, замечаний: %d\n' "$c_err" "$errors" "$c_off" "$warnings"

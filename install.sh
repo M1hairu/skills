@@ -8,19 +8,20 @@
 #
 #   --local                       — поставить в текущий проект, а не глобально
 #   --project <путь>              — то же, но проект указан явно
+#   --agents                      — заодно в ~/.agents/skills (Codex и прочие харнессы)
 #
 #   --dry-run                     — показать, что произойдёт, и ничего не делать
 #   --force                       — заменить мешающие реальные файлы (старое в бэкап)
 #   --uninstall                   — снять симлинки, ведущие в этот репозиторий
 #
 # Ставится симлинками, а не копиями: правка файла в репозитории действует
-# сразу, без переустановки.
+# сразу, без переустановки, а `git pull` обновляет все поставленные скиллы разом.
 #
 # Что куда идёт (соглашение, новые скиллы ничего здесь не меняют):
 #
-#   skills/<имя>/SKILL.md   → сам скилл, каталог линкуется в <область>/skills/<имя>
-#   skills/<имя>/bin/*      → команды, линкуются по одной в ~/.local/bin/
-#   skills/<имя>/claude/*   → файлы окружения Claude, линкуются в ~/.claude/
+#   skills/<категория>/<имя>/SKILL.md   → каталог линкуется в <область>/skills/<имя>
+#   skills/<категория>/<имя>/bin/*      → команды, по одной в ~/.local/bin/
+#   skills/<категория>/<имя>/claude/*   → файлы окружения Claude, в ~/.claude/
 #
 # Область — либо ~/.claude (глобально), либо <проект>/.claude (--local). Команды и файлы
 # окружения ставятся глобально в любом случае: $PATH один на систему, и скрипты скиллов
@@ -33,6 +34,7 @@ SKILLS_DIR="$REPO/skills"
 
 HOME_CLAUDE="${CLAUDE_HOME:-$HOME/.claude}"
 DEST_BIN="$HOME/.local/bin"
+AGENTS_SKILLS="$HOME/.agents/skills"
 # Бэкапы лежат в стороне: каталог с бэкапом внутри skills/ Claude Code
 # принял бы за ещё один скилл, и рядом с afk появился бы двойник afk.backup-…
 BACKUP_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/claude-skills/backups"
@@ -42,6 +44,7 @@ FORCE=0
 UNINSTALL=0
 LIST=0
 PICK=0
+AGENTS=0
 PROJECT=""
 WANTED=()
 
@@ -52,11 +55,12 @@ while [[ $# -gt 0 ]]; do
     --uninstall)  UNINSTALL=1; shift ;;
     --list|-l)    LIST=1; shift ;;
     -i|--pick|--interactive) PICK=1; shift ;;
+    --agents)     AGENTS=1; shift ;;
     --local)      PROJECT="$PWD"; shift ;;
     --project)
       [[ -n "${2:-}" ]] || { echo "install: --project ждёт путь" >&2; exit 2; }
       PROJECT="$2"; shift 2 ;;
-    -h|--help)    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)           echo "install: неизвестный флаг $1" >&2; exit 2 ;;
     *)            WANTED+=("$1"); shift ;;
   esac
@@ -70,11 +74,20 @@ if [[ -n "$PROJECT" ]]; then
     echo "install: проект — это домашний каталог; для всех проектов ставь без --local" >&2
     exit 2
   fi
-  DEST_SKILLS="$PROJECT/.claude/skills"
+  SKILL_DESTS=("$PROJECT/.claude/skills")
   SCOPE="проект $(basename "$PROJECT")"
 else
-  DEST_SKILLS="$HOME_CLAUDE/skills"
+  SKILL_DESTS=("$HOME_CLAUDE/skills")
   SCOPE="глобально"
+fi
+
+if (( AGENTS )); then
+  if [[ -n "$PROJECT" ]]; then
+    echo "install: --agents не сочетается с --local — каталог ~/.agents/skills общий" >&2
+    exit 2
+  fi
+  SKILL_DESTS+=("$AGENTS_SKILLS")
+  SCOPE="$SCOPE + ~/.agents/skills"
 fi
 DEST_CLAUDE="$HOME_CLAUDE"
 
@@ -97,18 +110,27 @@ short() {
   printf '%s' "${p/#$HOME/\~}"
 }
 
-# Описание скилла из фронтматтера — для --list и выбора руками.
+# Все скиллы репозитория как «категория/имя»; deprecated не ставим.
+all_skills() {
+  local f d
+  while IFS= read -r -d '' f; do
+    d="$(dirname "$f")"
+    printf '%s\n' "${d#"$SKILLS_DIR"/}"
+  done < <(find "$SKILLS_DIR" -name SKILL.md -not -path '*/deprecated/*' -print0 2>/dev/null) | sort
+}
+
 describe() {
   sed -n 's/^description:[[:space:]]*//p' "$SKILLS_DIR/$1/SKILL.md" 2>/dev/null \
     | head -1 | cut -c1-88
 }
 
-# Список скиллов: каталог с SKILL.md внутри.
-all_skills() {
-  local d
-  for d in "$SKILLS_DIR"/*/; do
-    [[ -f "$d/SKILL.md" ]] && basename "$d"
+# Скилл называют коротко («afk») или полно («autonomy/afk») — понимаем оба.
+resolve_skill() {
+  local want="$1" s
+  for s in "${AVAILABLE[@]}"; do
+    [[ "$s" == "$want" || "${s##*/}" == "$want" ]] && { printf '%s' "$s"; return 0; }
   done
+  return 1
 }
 
 # ── одна связь: link <источник в репо> <место назначения> ──
@@ -117,10 +139,12 @@ link() {
 
   if [[ -L "$dst" ]]; then
     local cur; cur="$(readlink -f "$dst" 2>/dev/null || true)"
-    if [[ "$cur" == "$(readlink -f "$src")" ]]; then
+    if [[ -n "$cur" && "$cur" == "$(readlink -f "$src")" ]]; then
       dim "$rel — уже стоит"; skipped=$((skipped + 1)); return
     fi
-    if [[ "$cur" == "$REPO"/* ]]; then
+    # Битый или переехавший симлинк в этот же репозиторий чиним молча.
+    local raw; raw="$(readlink "$dst")"
+    if [[ "$cur" == "$REPO"/* || "$raw" == "$REPO"/* ]]; then
       (( DRY )) || { rm "$dst"; ln -s "$src" "$dst"; }
       ok "$rel — переставлен"; linked=$((linked + 1)); return
     fi
@@ -150,16 +174,17 @@ link() {
 unlink_if_ours() {
   local dst="$1" rel; rel="$(short "$1")"
   [[ -L "$dst" ]] || return 0
-  local cur; cur="$(readlink -f "$dst" 2>/dev/null || true)"
-  [[ "$cur" == "$REPO"/* ]] || return 0
+  local cur raw; cur="$(readlink -f "$dst" 2>/dev/null || true)"; raw="$(readlink "$dst")"
+  [[ "$cur" == "$REPO"/* || "$raw" == "$REPO"/* ]] || return 0
   (( DRY )) || rm "$dst"
   ok "снят $rel"; removed=$((removed + 1))
 }
 
 install_skill() {
-  local name="$1" dir="$SKILLS_DIR/$1" f
-  say "$name"
-  link "$dir" "$DEST_SKILLS/$name"
+  local rel="$1" dir="$SKILLS_DIR/$1" name="${1##*/}" f d
+  say "$rel"
+
+  for d in "${SKILL_DESTS[@]}"; do link "$dir" "$d/$name"; done
 
   if [[ -d "$dir/bin" ]]; then
     for f in "$dir"/bin/*; do
@@ -178,9 +203,10 @@ install_skill() {
 }
 
 uninstall_skill() {
-  local name="$1" dir="$SKILLS_DIR/$1" f
-  say "$name"
-  unlink_if_ours "$DEST_SKILLS/$name"
+  local rel="$1" dir="$SKILLS_DIR/$1" name="${1##*/}" f d
+  say "$rel"
+
+  for d in "${SKILL_DESTS[@]}"; do unlink_if_ours "$d/$name"; done
 
   # Из проекта снимаем только сам скилл: команды и файлы окружения стоят глобально
   # и нужны другим проектам — снять их отсюда значило бы сломать соседей.
@@ -208,7 +234,7 @@ pick_skills() {
 
   printf 'Скиллы репозитория:\n\n' >&2
   for s in "${AVAILABLE[@]}"; do
-    printf '  %2d) %-10s %s\n' "$i" "$s" "$(describe "$s")" >&2
+    printf '  %2d) %-22s %s\n' "$i" "$s" "$(describe "$s")" >&2
     i=$((i + 1))
   done
   printf '\nНомера через пробел (пусто — все, q — выход): ' >&2
@@ -242,19 +268,16 @@ if [[ ${#AVAILABLE[@]} -eq 0 ]]; then
 fi
 
 if (( LIST )); then
-  for s in "${AVAILABLE[@]}"; do printf '%-12s %s\n' "$s" "$(describe "$s")"; done
+  for s in "${AVAILABLE[@]}"; do printf '%-24s %s\n' "$s" "$(describe "$s")"; done
   exit 0
 fi
 
 TARGETS=()
 if [[ ${#WANTED[@]} -gt 0 ]]; then
   for w in "${WANTED[@]}"; do
-    if [[ -f "$SKILLS_DIR/$w/SKILL.md" ]]; then
-      TARGETS+=("$w")
-    else
-      echo "install: нет такого скилла — $w (см. ./install.sh --list)" >&2
-      exit 1
-    fi
+    resolved="$(resolve_skill "$w")" || {
+      echo "install: нет такого скилла — $w (см. ./install.sh --list)" >&2; exit 1; }
+    TARGETS+=("$resolved")
   done
 elif (( PICK )); then
   # Через переменную, а не подстановку процесса: иначе ошибка выбора потеряется
@@ -276,7 +299,9 @@ if (( UNINSTALL )); then
   exit 0
 fi
 
-(( DRY )) || mkdir -p "$DEST_SKILLS" "$DEST_BIN"
+if (( ! DRY )); then
+  mkdir -p "${SKILL_DESTS[@]}" "$DEST_BIN"
+fi
 
 for s in "${TARGETS[@]}"; do install_skill "$s"; say ""; done
 
@@ -302,7 +327,7 @@ esac
 for s in "${TARGETS[@]}"; do
   if [[ -f "$SKILLS_DIR/$s/SETUP.md" ]]; then
     say ""
-    say "$s требует настройки — см. skills/$s/SETUP.md"
+    say "${s##*/} требует настройки — см. skills/$s/SETUP.md"
   fi
 done
 
