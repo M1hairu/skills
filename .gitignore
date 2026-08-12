@@ -1,0 +1,5 @@
+# Локальные конфиги скиллов живут в ~/.config/claude-skills/, не здесь.
+*.env
+!*.example.env
+*.backup-*
+.DS_Store

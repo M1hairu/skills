@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Вынести работу по текущему проекту на VPS и уйти.
+#
+#   vps-afk                          — проект и ветка берутся из текущего репозитория
+#   vps-afk --branch afk/asr         — работать в отдельной ветке (создаст, если нет)
+#   vps-afk --send .env,local.conf   — доставить файлы, которых нет в git, по rsync
+#   vps-afk --steps 40 --hours 12    — потолок шагов и дедлайн прогона
+#   vps-afk --stop                   — остановить прогон по этому проекту
+#
+# Код едет через git-хостинг, секреты — мимо него, по rsync. На сервере работает
+# автономный раннер, отчёт идёт в чат проекта.
+#
+# Сервер и пути к раннеру берутся из ~/.config/claude-skills/vps-afk.env,
+# см. SETUP.md рядом со скиллом.
+
+set -euo pipefail
+
+CONFIG="${VPS_AFK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-skills/vps-afk.env}"
+
+if [[ -f "$CONFIG" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+fi
+
+VPS="${VPS_AFK_HOST:-}"
+if [[ -z "$VPS" ]]; then
+  cat >&2 <<EOF
+vps-afk: не задан сервер.
+
+Создай $CONFIG:
+
+    VPS_AFK_HOST=пользователь@хост
+    VPS_AFK_RUNNER=skills/autonomous-loop/runner.py   # путь от \$HOME на сервере
+
+Подробности — в SETUP.md скилла vps-afk.
+EOF
+  exit 1
+fi
+
+# Пути на сервере задаются относительно его \$HOME — раскрываются там, не здесь.
+PROJECTS_REL="${VPS_AFK_PROJECTS:-projects}"
+RUNNER_REL="${VPS_AFK_RUNNER:-skills/autonomous-loop/runner.py}"
+TOPICS_REL="${VPS_AFK_TOPICS:-}"
+LOGS_REL="${VPS_AFK_LOGS:-.afk/runs}"
+
+BRANCH=""
+SEND=""
+STEPS="${VPS_AFK_STEPS:-30}"
+HOURS="${VPS_AFK_HOURS:-10}"
+STOP=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --branch) BRANCH="$2"; shift 2 ;;
+    --send)   SEND="$2";   shift 2 ;;
+    --steps)  STEPS="$2";  shift 2 ;;
+    --hours)  HOURS="$2";  shift 2 ;;
+    --stop)   STOP=1;      shift ;;
+    *) echo "vps-afk: неизвестный флаг $1" >&2; exit 2 ;;
+  esac
+done
+
+git rev-parse --git-dir >/dev/null 2>&1 || {
+  echo "vps-afk: это не git-репозиторий. Код едет на VPS через origin, без git — некуда." >&2
+  exit 1
+}
+
+ROOT=$(git rev-parse --show-toplevel)
+PROJECT=$(basename "$ROOT")
+
+if [[ "$STOP" == 1 ]]; then
+  ssh "$VPS" "systemctl --user stop afk-${PROJECT}.service 2>/dev/null || true; echo остановлено"
+  exit 0
+fi
+
+BRANCH="${BRANCH:-$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)}"
+if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]]; then
+  BRANCH="afk/$(date +%m%d-%H%M)"
+  echo "→ работа в главной ветке не ведётся, беру $BRANCH"
+fi
+
+REMOTE=$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)
+[[ -n "$REMOTE" ]] || { echo "vps-afk: у репозитория нет origin — некуда пушить." >&2; exit 1; }
+
+# ── 1. Отправить код через git-хостинг ──
+git -C "$ROOT" rev-parse --verify "$BRANCH" >/dev/null 2>&1 || git -C "$ROOT" branch "$BRANCH"
+git -C "$ROOT" push -u origin "$BRANCH"
+echo "→ ветка $BRANCH отправлена в origin"
+
+# ── 2. Развернуть на VPS ──
+ssh "$VPS" "set -e
+  DIR=\"\$HOME/$PROJECTS_REL/$PROJECT\"
+  mkdir -p \"\$HOME/$PROJECTS_REL\"
+  if [ -d \"\$DIR/.git\" ]; then
+    git -C \"\$DIR\" fetch origin --prune
+  else
+    git clone '$REMOTE' \"\$DIR\"
+  fi
+  git -C \"\$DIR\" checkout -B '$BRANCH' 'origin/$BRANCH'
+  echo '→ на VPS: '\$(git -C \"\$DIR\" rev-parse --short HEAD)"
+
+# ── 3. Досылать то, чего в git нет и быть не должно ──
+if [[ -n "$SEND" ]]; then
+  IFS=',' read -ra PATHS <<< "$SEND"
+  for p in "${PATHS[@]}"; do
+    [[ -e "$ROOT/$p" ]] || { echo "vps-afk: нет файла $p — пропускаю" >&2; continue; }
+    rsync -az "$ROOT/$p" "$VPS:$PROJECTS_REL/$PROJECT/$(dirname "$p")/"
+    echo "→ доставлено мимо git: $p"
+  done
+fi
+
+# ── 4. Чат проекта, если он настроен ──
+if [[ -n "$TOPICS_REL" ]]; then
+  ssh "$VPS" "python3 \"\$HOME/$TOPICS_REL\" ensure '$PROJECT' --branch '$BRANCH' >/dev/null && echo '→ чат проекта готов'"
+fi
+
+# ── 5. Запуск прогона: переживает разрыв ssh и закрытый ноутбук ──
+ssh "$VPS" "systemctl --user reset-failed afk-${PROJECT}.service 2>/dev/null || true
+  systemd-run --user --unit=afk-${PROJECT} --collect \
+    --setenv=PATH=\"\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin\" \
+    python3 \"\$HOME/$RUNNER_REL\" \
+      --project '$PROJECT' --repo \"\$HOME/$PROJECTS_REL/$PROJECT\" \
+      --branch '$BRANCH' --max-steps $STEPS --deadline-hours $HOURS"
+
+echo
+echo "Прогон идёт на VPS. Ноут свободен — можно закрывать."
+echo "  смотреть:      ssh $VPS 'tail -f ~/$LOGS_REL/$PROJECT.log'"
+echo "  остановить:    vps-afk --stop"
+echo "  забрать утром: git -C $ROOT pull origin $BRANCH"

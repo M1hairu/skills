@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Автономный сеанс Claude Code на время отсутствия.
+#
+#   afk                       — сеанс в текущем каталоге, вопросов не задаёт
+#   afk "доделай авторизацию" — с начальной задачей
+#   afk -c "доделай"          — подхватить последнюю сессию в этом каталоге и уйти
+#   afk -r [id] "доделай"     — то же, но с выбором сессии (без id — интерактивный список)
+#   afk --yolo "..."          — без ограничений разрешений (только для git-репо, который не жалко)
+#   afk --cloud "..."         — сеанс на стороне Anthropic, ноутбук можно выключить
+#
+# Ноутбук не уснёт и не среагирует на закрытие крышки, пока сеанс жив.
+
+set -euo pipefail
+
+POLICY="$HOME/.claude/afk-policy.md"
+MODE="dontAsk"
+CLOUD=0
+RESUME=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --yolo)  MODE="bypassPermissions"; shift ;;
+    --cloud) CLOUD=1; shift ;;
+    -c|--continue) RESUME=(--continue); shift ;;
+    -r|--resume)
+      shift
+      # id сессии — только если следующий аргумент похож на UUID
+      if [[ "${1:-}" =~ ^[0-9a-fA-F-]{36}$ ]]; then RESUME=(--resume "$1"); shift
+      else RESUME=(--resume); fi ;;
+    --)      shift; break ;;
+    -*)      echo "afk: неизвестный флаг $1" >&2; exit 2 ;;
+    *)       break ;;
+  esac
+done
+
+PROMPT="${*:-}"
+
+if [[ ! -f "$POLICY" ]]; then
+  echo "afk: нет файла политики $POLICY" >&2
+  exit 1
+fi
+
+if [[ "$CLOUD" == 1 ]]; then
+  if [[ ${#RESUME[@]} -gt 0 ]]; then
+    echo "afk: --cloud не продолжает локальную сессию; перенеси её командой /teleport прямо в сеансе" >&2
+    exit 2
+  fi
+  # Облачная сессия: изолированная одноразовая среда, поэтому bypass здесь безопасен.
+  exec claude --cloud "${PROMPT:-Автономная работа по PLAN.md}" \
+              --permission-mode bypassPermissions \
+              --append-system-prompt-file "$POLICY"
+fi
+
+NAME="afk-$(basename "$PWD")"
+
+exec systemd-inhibit \
+  --what=idle:sleep:handle-lid-switch \
+  --who=afk --why="Claude Code работает автономно" \
+  claude --remote-control "$NAME" \
+         "${RESUME[@]}" \
+         --permission-mode "$MODE" \
+         --append-system-prompt-file "$POLICY" \
+         ${PROMPT:+"$PROMPT"}
