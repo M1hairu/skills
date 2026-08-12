@@ -19,8 +19,8 @@
 <summary><strong>Симлинками (правишь под себя)</strong></summary>
 
 ```bash
-git clone https://github.com/M1hairu/claude-skills.git ~/Documents/claude-skills
-cd ~/Documents/claude-skills
+git clone https://github.com/M1hairu/skills.git ~/Documents/skills
+cd ~/Documents/skills
 ./install.sh
 ```
 
@@ -53,7 +53,7 @@ cd ~/Documents/claude-skills
 Из сессии Claude Code:
 
 ```
-/plugin marketplace add M1hairu/claude-skills
+/plugin marketplace add M1hairu/skills
 /plugin install m1x-skills@m1hairu
 ```
 
