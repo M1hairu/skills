@@ -7,7 +7,6 @@
 #   afk -r [id] "доделай"     — то же, но с выбором сессии (без id — интерактивный список)
 #   afk --yolo "..."          — без ограничений разрешений (только для git-репо, который не жалко)
 #   afk --cloud "..."         — сеанс на стороне Anthropic, ноутбук можно выключить
-#   afk -m sonnet "..."       — на другой модели: она расходует недельный кап медленнее
 #   afk --no-watch "..."      — без сторожа, который поднимает работу после лимита и обрыва связи
 #
 # Ноутбук не уснёт и не среагирует на закрытие крышки, пока сеанс жив.
@@ -18,7 +17,6 @@ POLICY="$HOME/.claude/afk-policy.md"
 MODE="dontAsk"
 CLOUD=0
 WATCH=1
-MODEL=""
 RESUME=()
 
 while [[ $# -gt 0 ]]; do
@@ -26,7 +24,6 @@ while [[ $# -gt 0 ]]; do
     --yolo)  MODE="bypassPermissions"; shift ;;
     --cloud) CLOUD=1; shift ;;
     --no-watch) WATCH=0; shift ;;
-    -m|--model) MODEL="${2:?afk: -m без имени модели}"; shift 2 ;;
     -c|--continue) RESUME=(--continue); shift ;;
     -r|--resume)
       shift
@@ -55,7 +52,6 @@ if [[ "$CLOUD" == 1 ]]; then
   # Сторожа тут нет: сеанс живёт у Anthropic, поднимать его с ноутбука нечем.
   exec claude --cloud "${PROMPT:-Автономная работа по PLAN.md}" \
               --permission-mode bypassPermissions \
-              ${MODEL:+--model "$MODEL"} \
               --append-system-prompt-file "$POLICY"
 fi
 
@@ -64,7 +60,7 @@ command -v afk-limits >/dev/null && afk-limits || true
 
 # Сторож поднимет работу, если ночью кончится пятичасовое окно или оборвётся связь.
 if [[ "$WATCH" == 1 ]] && command -v afk-watch >/dev/null; then
-  AFK_MODEL="$MODEL" AFK_PERMISSION_MODE="$MODE" afk-watch --start || true
+  AFK_PERMISSION_MODE="$MODE" afk-watch --start || true
 fi
 
 NAME="afk-$(basename "$PWD")"
@@ -75,6 +71,5 @@ exec systemd-inhibit \
   claude --remote-control "$NAME" \
          "${RESUME[@]}" \
          --permission-mode "$MODE" \
-         ${MODEL:+--model "$MODEL"} \
          --append-system-prompt-file "$POLICY" \
          ${PROMPT:+"$PROMPT"}

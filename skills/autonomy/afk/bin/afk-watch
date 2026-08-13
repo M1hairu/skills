@@ -22,7 +22,6 @@ WEEKLY_FLOOR="${AFK_WEEKLY_FLOOR:-90}"
 MAX_RESUMES="${AFK_MAX_RESUMES:-6}"
 CHECK_SEC="${AFK_CHECK_SEC:-300}"
 MODE="${AFK_PERMISSION_MODE:-dontAsk}"
-MODEL="${AFK_MODEL:-}"
 
 ACTION=""
 DIR="$PWD"
@@ -120,7 +119,9 @@ except Exception:
 ' "$LIMITS" "$1" "$2"
 }
 
-online() { curl -s -o /dev/null -m 8 https://api.anthropic.com/ 2>/dev/null; }
+# Связь есть, если api.anthropic.com отвечает хоть чем-нибудь (адрес переопределяется
+# через AFK_PING_URL — так проверяется поведение при обрыве).
+online() { curl -s -o /dev/null -m 8 "${AFK_PING_URL:-https://api.anthropic.com/}" 2>/dev/null; }
 
 journal() {
   local file="$DIR/JOURNAL.md"
@@ -143,7 +144,6 @@ start_session() {
   args=(--bg --permission-mode "$MODE")
   [[ -f "$POLICY" ]] && args+=(--append-system-prompt-file "$POLICY")
   [[ -n "$sid" ]] && args+=(--resume "$sid")
-  [[ -n "$MODEL" ]] && args+=(--model "$MODEL")
 
   out=$(cd "$DIR" && claude "${args[@]}" "$RESUME_PROMPT" 2>&1 | head -3)
   id=$(grep -oE 'backgrounded · [0-9a-f]+' <<< "$out" | awk '{print $3}' || true)
@@ -319,7 +319,6 @@ case "$ACTION" in
     state_set last_resume 0
     state_set hit_limit ""
     state_set resume_sid "$(sessions | head -1 | cut -d'|' -f3)"
-    [[ -n "$MODEL" ]] && state_set model "$MODEL"
 
     # Служебные файлы сторожа не должны попадать в ночные коммиты.
     if [[ -d "$DIR/.git" ]] && ! grep -qs '^\.afk/$' "$DIR/.git/info/exclude"; then
@@ -333,7 +332,6 @@ case "$ACTION" in
       --setenv="AFK_MAX_RESUMES=$MAX_RESUMES" \
       --setenv="AFK_CHECK_SEC=$CHECK_SEC" \
       --setenv="AFK_PERMISSION_MODE=$MODE" \
-      --setenv="AFK_MODEL=$MODEL" \
       --setenv="PATH=$PATH" \
       systemd-inhibit --what=idle:sleep:handle-lid-switch \
         --who=afk-watch --why="ночная работа Claude Code" \
