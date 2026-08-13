@@ -58,6 +58,10 @@ fi
 # Сколько осталось от лимитов — видно до ухода, а не утром по недоделанной работе.
 command -v afk-limits >/dev/null && afk-limits || true
 
+# Без хука `dontAsk` молча отклоняет всё, что требует разрешения, — работа встанет
+# не на вопросе, так на отказе.
+command -v afk-autonomy >/dev/null && afk-autonomy --on || true
+
 # Сторож поднимет работу, если ночью кончится пятичасовое окно или оборвётся связь.
 if [[ "$WATCH" == 1 ]] && command -v afk-watch >/dev/null; then
   AFK_PERMISSION_MODE="$MODE" afk-watch --start || true

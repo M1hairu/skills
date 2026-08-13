@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Ночная автономность прямо в идущей сессии: разрешения перестают её останавливать.
+#
+#   afk-autonomy --on      — включить на этот проект
+#   afk-autonomy --off     — выключить и вернуть настройки как были
+#   afk-autonomy --status  — включена ли сейчас
+#
+# Режим сессии (`manual`, `acceptEdits`) поменять на ходу нельзя — он задаётся при
+# запуске процесса. Зато хуки Claude Code перечитывает на лету, а хук `PreToolUse`
+# умеет сам выдавать разрешение. Поэтому в `<проект>/.claude/settings.local.json`
+# кладётся хук, который отвечает «allow» на всё, кроме заведомо опасного, — и сессия
+# работает до утра, ничего не спрашивая. Прежний файл настроек лежит в `.afk/`
+# и возвращается по `--off`.
+#
+# Опасное хук по-прежнему запрещает: ключи и учётные данные, `sudo`, форс-пуш,
+# рекурсивное удаление вне проекта. Этим он лучше `--dangerously-skip-permissions`,
+# где не действует даже `permissions.deny`.
+
+set -euo pipefail
+
+DIR="$PWD"
+ACTION=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --on|--off|--status) ACTION="${1#--}"; shift ;;
+    --hook)   ACTION=hook; shift ;;
+    --dir)    DIR="$(readlink -f "$2")"; shift 2 ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "afk-autonomy: неизвестный флаг $1" >&2; exit 2 ;;
+  esac
+done
+
+# ── решение по конкретному вызову инструмента ─────────────────────────────────
+# Так скрипт зовёт сам Claude Code: на stdin JSON вызова, на stdout — вердикт.
+if [[ "$ACTION" == hook ]]; then
+  # Код передаётся через -c, а не heredoc: stdin занят самим вызовом инструмента.
+  exec python3 -c '
+import json, re, sys, os
+
+def verdict(decision, reason):
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": decision,
+        "permissionDecisionReason": reason,
+    }}, ensure_ascii=False))
+    sys.exit(0)
+
+try:
+    event = json.load(sys.stdin)
+except Exception:
+    verdict("allow", "режим AFK")
+
+tool = event.get("tool_name", "")
+data = event.get("tool_input") or {}
+text = " ".join(str(v) for v in data.values() if isinstance(v, (str, int, float)))
+home = os.path.expanduser("~")
+
+# Секреты: ночью их не читают и не правят, даже когда очень надо.
+SECRETS = (r"\.ssh/", r"\.gnupg", r"\.aws/", r"\.netrc", r"\.git-credentials",
+           r"\.credentials\.json", r"\.config/sing-box", r"id_(rsa|ed25519|ecdsa)")
+for pattern in SECRETS:
+    if re.search(pattern, text):
+        verdict("deny", "ключи и учётные данные ночью не трогаем — запиши в BLOCKED.md")
+
+if tool == "Bash":
+    command = str(data.get("command", ""))
+    DANGEROUS = (
+        (r"\bsudo\b", "sudo без человека"),
+        (r"\bmkfs|\bdd\s+if=.*of=/dev/", "запись на устройство"),
+        (r"git\s+push\s+\S*\s*(--force|-f)\b", "форс-пуш"),
+        (r"\bshutdown\b|\breboot\b|\bsystemctl\s+(poweroff|reboot)", "выключение машины"),
+        (r":\(\)\{.*\};:", "форк-бомба"),
+    )
+    for pattern, why in DANGEROUS:
+        if re.search(pattern, command):
+            verdict("deny", f"{why} — не ночью; опиши в BLOCKED.md и иди дальше")
+
+    # Рекурсивно удалять можно только у себя в проекте и во временных файлах:
+    # ошибка в пути ночью стоит чужих данных.
+    if re.search(r"\brm\b", command) and re.search(r"\s-[a-zA-Z]*[rR]", command):
+        project = event.get("cwd") or os.getcwd()
+        outside = []
+        for target in re.findall(r"(?<![\w/=])(~[^\s;|&]*|/[^\s;|&]*)", command):
+            full = os.path.expanduser(target)
+            if not (full.startswith(project.rstrip("/") + "/") or full.startswith("/tmp/")):
+                outside.append(target)
+        if outside:
+            verdict("deny", f"рекурсивное удаление вне проекта ({outside[0]}) — не ночью")
+
+verdict("allow", "режим AFK: разрешения не останавливают работу")
+'
+fi
+
+[[ -n "$ACTION" ]] || ACTION=status
+
+SELF="$(readlink -f "$0")"
+AFKDIR="$DIR/.afk"
+SETTINGS="$DIR/.claude/settings.local.json"
+BACKUP="$AFKDIR/settings.local.json.before-afk"
+MARK="$AFKDIR/autonomy.on"
+
+case "$ACTION" in
+  on)
+    mkdir -p "$AFKDIR" "$DIR/.claude"
+    if [[ -e "$MARK" ]]; then
+      echo "автономность уже включена для $DIR"
+      exit 0
+    fi
+    # Прежние настройки проекта возвращаются по --off в точности, вплоть до их отсутствия.
+    if [[ -f "$SETTINGS" ]]; then cp "$SETTINGS" "$BACKUP"; else rm -f "$BACKUP"; fi
+
+    # Короткая форма, если команда в $PATH: путь к репозиторию в настройках проекта
+    # чужой машине ни к чему.
+    command -v afk-autonomy >/dev/null && SELF="afk-autonomy"
+
+    SELF="$SELF" python3 - "$SETTINGS" <<'PY'
+import json, os, sys
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+
+hooks = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
+hooks.append({
+    "matcher": "*",
+    "hooks": [{"type": "command", "command": f"{os.environ['SELF']} --hook", "timeout": 10}],
+})
+with open(path, "w") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+PY
+    touch "$MARK"
+    echo "автономность включена: разрешения больше не останавливают работу в $DIR"
+    echo "опасное (ключи, sudo, форс-пуш, rm -rf вне проекта) хук по-прежнему отклоняет"
+    ;;
+
+  off)
+    if [[ -f "$BACKUP" ]]; then
+      mkdir -p "$DIR/.claude" && cp "$BACKUP" "$SETTINGS" && rm -f "$BACKUP"
+    elif [[ -f "$SETTINGS" ]]; then
+      # Файла до нас не было — убираем только свой хук, чужое не трогаем.
+      python3 - "$SETTINGS" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+pre = (data.get("hooks") or {}).get("PreToolUse") or []
+pre = [g for g in pre if "afk-autonomy --hook" not in json.dumps(g)]
+if pre:
+    data["hooks"]["PreToolUse"] = pre
+else:
+    data.get("hooks", {}).pop("PreToolUse", None)
+    if not data.get("hooks"):
+        data.pop("hooks", None)
+with open(path, "w") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+PY
+      [[ -s "$SETTINGS" ]] && [[ "$(tr -d '[:space:]' < "$SETTINGS")" == "{}" ]] && rm -f "$SETTINGS"
+    fi
+    rm -f "$MARK"
+    echo "автономность выключена, настройки $DIR вернулись как были"
+    ;;
+
+  status)
+    if [[ -e "$MARK" ]]; then
+      echo "автономность включена для $DIR (хук в .claude/settings.local.json)"
+    else
+      echo "автономность выключена для $DIR"
+    fi
+    ;;
+esac
