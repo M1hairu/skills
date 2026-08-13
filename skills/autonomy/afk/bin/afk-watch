@@ -217,20 +217,30 @@ tick() {
     return 10
   fi
 
-  local watch_start hb kind pid sid status started name
+  local watch_start hb kind pid sid status started name human=""
   watch_start="$(state_num started)"
 
-  # Человек вернулся и работает сам — сторожу тут больше нечего делать. Ночные сессии
-  # `afk` зовёт «afk-<каталог>», так что ручную видно по имени.
+  # Своя сессия человека, заведённая уже при живом стороже: ночные `afk` зовёт
+  # «afk-<каталог>», у ручных имя другое. Пока такая рядом, сторож не поднимает
+  # ничего — но и не снимается: вкладку могут закрыть через минуту, а ночь
+  # останется без присмотра.
   while IFS='|' read -r kind pid sid status started name; do
     [[ "$kind" == interactive ]] || continue
     [[ "$name" == afk-* ]] && continue
     [[ "$started" =~ ^[0-9]+$ ]] || continue
-    if (( started / 1000 > watch_start + 60 )); then
-      log "в каталоге появилась своя сессия «$name» — человек вернулся, снимаюсь"
-      return 10
-    fi
+    (( started / 1000 > watch_start + 60 )) && human="$name"
   done < <(sessions)
+
+  if [[ -n "$human" ]]; then
+    [[ "$(state_get paused)" == 1 ]] || log "рядом своя сессия «$human» — приостанавливаюсь, работу не трогаю"
+    state_set paused 1
+    return 0
+  fi
+
+  if [[ "$(state_get paused)" == 1 ]]; then
+    log "своя сессия закрылась — снова слежу"
+    state_set paused 0
+  fi
 
   # Пока сессия на месте, помним её контекст: с ним же её и поднимать.
   sid="$(sessions | head -1 | cut -d'|' -f3)"
