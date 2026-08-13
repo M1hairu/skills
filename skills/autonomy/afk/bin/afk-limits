@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Сколько осталось от лимитов подписки Claude и когда они сбросятся.
+#
+#   afk-limits          — коротко, человеку
+#   afk-limits --json   — то же для скриптов
+#   afk-limits --stale  — не обновлять данные, взять кеш как есть
+#
+# Данные лежат в кеше ~/.claude.json, который Claude Code обновляет по ходу работы.
+# Кеш старше пяти минут освежается через `claude -p /usage` — это локальная команда,
+# лимит она не тратит.
+
+set -euo pipefail
+
+CONFIG="${CLAUDE_CONFIG_FILE:-$HOME/.claude.json}"
+MAX_AGE="${AFK_LIMITS_MAX_AGE:-300}"
+FORMAT=text
+REFRESH=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)  FORMAT=json; shift ;;
+    --stale) REFRESH=0; shift ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "afk-limits: неизвестный флаг $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ ! -f "$CONFIG" ]]; then
+  echo "afk-limits: нет файла $CONFIG — Claude Code на этой машине не запускался" >&2
+  exit 1
+fi
+
+age_sec() {
+  python3 - "$CONFIG" <<'PY'
+import json, sys, time
+try:
+    d = json.load(open(sys.argv[1]))
+    print(int(time.time() - d["cachedUsageUtilization"]["fetchedAtMs"] / 1000))
+except Exception:
+    print(10**9)
+PY
+}
+
+# Свежие цифры важнее скорости: решение «работать дальше или сворачиваться»
+# принимается по ним.
+if [[ "$REFRESH" == 1 && "$(age_sec)" -gt "$MAX_AGE" ]]; then
+  claude -p /usage >/dev/null 2>&1 || true
+fi
+
+python3 - "$CONFIG" "$FORMAT" <<'PY'
+import json, sys, time
+from datetime import datetime, timezone
+
+config, fmt = sys.argv[1], sys.argv[2]
+
+try:
+    cached = json.load(open(config))["cachedUsageUtilization"]
+    util = cached["utilization"]
+except Exception:
+    print("afk-limits: в конфиге нет данных о лимитах — запусти `claude -p /usage`", file=sys.stderr)
+    sys.exit(1)
+
+now = time.time()
+age = int(now - cached["fetchedAtMs"] / 1000)
+
+
+def bucket(raw):
+    if not raw:
+        return None
+    resets_at = raw.get("resets_at")
+    left = None
+    if resets_at:
+        left = int(datetime.fromisoformat(resets_at).timestamp() - now)
+    return {
+        "percent": raw.get("utilization"),
+        "resets_at": resets_at,
+        "resets_in_sec": left,
+    }
+
+
+session = bucket(util.get("five_hour"))
+weekly = bucket(util.get("seven_day"))
+
+scoped = None
+for limit in util.get("limits") or []:
+    if limit.get("kind") == "weekly_scoped" and limit.get("scope"):
+        model = (limit["scope"].get("model") or {}).get("display_name")
+        resets_at = limit.get("resets_at")
+        scoped = {
+            "model": model,
+            "percent": limit.get("percent"),
+            "resets_at": resets_at,
+            "resets_in_sec": int(datetime.fromisoformat(resets_at).timestamp() - now) if resets_at else None,
+        }
+
+out = {"age_sec": age, "session": session, "weekly": weekly, "scoped": scoped}
+
+if fmt == "json":
+    print(json.dumps(out, ensure_ascii=False))
+    sys.exit(0)
+
+
+def left_words(sec):
+    if sec is None:
+        return "неизвестно когда"
+    if sec <= 0:
+        return "уже сброшен"
+    days, rest = divmod(sec, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"через {days} дн {hours} ч"
+    if hours:
+        return f"через {hours} ч {minutes} мин"
+    return f"через {minutes} мин"
+
+
+def when(resets_at):
+    if not resets_at:
+        return "без срока"
+    local = datetime.fromisoformat(resets_at).astimezone()
+    today = datetime.now(timezone.utc).astimezone().date()
+    return local.strftime("%H:%M") if local.date() == today else local.strftime("%d.%m %H:%M")
+
+
+def line(title, data):
+    if not data or data["percent"] is None:
+        return f"{title:<18} нет данных"
+    return (f"{title:<18} {data['percent']:>3}% · сброс {when(data['resets_at'])} "
+            f"({left_words(data['resets_in_sec'])})")
+
+
+print(line("пятичасовое окно", session))
+print(line("недельный кап", weekly))
+if scoped and scoped["percent"]:
+    print(line(f"недельный, {scoped['model']}", scoped))
+
+if age > 900:
+    print(f"\nданные из кеша, обновлялись {age // 60} мин назад")
+PY

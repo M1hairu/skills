@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# Сторож ночной сессии: поднимает работу, если она встала — кончился лимит
+# подписки или оборвалась связь.
+#
+#   afk-watch --start    — приставить сторожа к текущему каталогу
+#   afk-watch --status   — что он видит прямо сейчас
+#   afk-watch --once     — одна проверка вслух, ничего не запуская
+#   afk-watch --stop     — снять сторожа
+#
+# Живая сессия каждый виток трогает `.afk/heartbeat` (так велит afk-policy.md).
+# Если файл не обновлялся дольше AFK_IDLE_MIN минут, сторож разбирается, почему:
+# нет связи или выбрано пятичасовое окно — ждёт, иначе поднимает работу заново
+# фоновой сессией с прежним контекстом. Недельный кап он не проедает: выше
+# AFK_WEEKLY_FLOOR процентов работа не возобновляется, остаток остаётся человеку.
+
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+POLICY="${AFK_POLICY:-$HOME/.claude/afk-policy.md}"
+IDLE_MIN="${AFK_IDLE_MIN:-30}"
+WEEKLY_FLOOR="${AFK_WEEKLY_FLOOR:-90}"
+MAX_RESUMES="${AFK_MAX_RESUMES:-6}"
+CHECK_SEC="${AFK_CHECK_SEC:-300}"
+MODE="${AFK_PERMISSION_MODE:-dontAsk}"
+MODEL="${AFK_MODEL:-}"
+
+ACTION=""
+DIR="$PWD"
+DRY=1
+
+RESUME_PROMPT="${AFK_RESUME_PROMPT:-Ночная автономная работа прервалась (кончился лимит или оборвалась связь), \
+сейчас можно продолжать. Прочитай PLAN.md, JOURNAL.md, BLOCKED.md и посмотри git log и git status, \
+чтобы понять, на чём остановились. Продолжай с этого места по правилам AFK: виток цикла — шаг, критик, \
+правка, запись в JOURNAL.md, и каждый виток трогай .afk/heartbeat. Замкни работу скиллом loop, \
+иначе всё встанет после первого же хода.}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --start)  ACTION=start; shift ;;
+    --stop)   ACTION=stop; shift ;;
+    --status) ACTION=status; shift ;;
+    --once)   ACTION=once; shift ;;
+    --daemon) ACTION=daemon; DRY=0; shift ;;
+    --force)  DRY=0; shift ;;
+    --dir)    DIR="$(readlink -f "$2")"; shift 2 ;;
+    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "afk-watch: неизвестный флаг $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ -n "$ACTION" ]] || ACTION=status
+
+AFKDIR="$DIR/.afk"
+STATE="$AFKDIR/watch.state"
+LOGFILE="$AFKDIR/watch.log"
+
+SLUG="$(basename "$DIR" | tr -c 'A-Za-z0-9_-' '-')-$(printf '%s' "$DIR" | sha1sum | cut -c1-8)"
+UNIT="afk-watch-$SLUG"
+
+# ── мелочи ────────────────────────────────────────────────────────────────────
+
+say() { printf '%s\n' "$*"; }
+
+# Событие: и в журнал сторожа, и на глаза (в daemon-режиме это уходит в journald).
+log() {
+  mkdir -p "$AFKDIR"
+  printf '%s  %s\n' "$(date '+%d.%m %H:%M')" "$*" >> "$LOGFILE"
+  say "$*"
+}
+
+state_get() { [[ -f "$STATE" ]] && sed -n "s/^$1=//p" "$STATE" | tail -1 || true; }
+
+state_set() {
+  mkdir -p "$AFKDIR"
+  touch "$STATE"
+  grep -v "^$1=" "$STATE" > "$STATE.tmp" 2>/dev/null || true
+  printf '%s=%s\n' "$1" "$2" >> "$STATE.tmp"
+  mv "$STATE.tmp" "$STATE"
+}
+
+state_num() { local v; v="$(state_get "$1")"; [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0; }
+
+now() { date +%s; }
+
+# Возраст файла в секундах; несуществующего — заведомо большой.
+age_of() { if [[ -e "$1" ]]; then echo $(( $(now) - $(stat -c %Y "$1") )); else echo 999999; fi; }
+
+# Сессии Claude Code в этом каталоге, свежая первой: kind|pid|sessionId|status|startedAt|name
+sessions() {
+  claude agents --json 2>/dev/null | python3 -c '
+import json, sys
+target = sys.argv[1]
+try:
+    rows = [r for r in json.load(sys.stdin) if r.get("cwd") == target]
+except Exception:
+    rows = []
+rows.sort(key=lambda r: r.get("startedAt") or 0, reverse=True)
+for r in rows:
+    print("|".join(str(r.get(k, "")) for k in ("kind", "pid", "sessionId", "status", "startedAt", "name")))
+' "$DIR" 2>/dev/null || true
+}
+
+limits() {
+  local near
+  near="$(dirname "$SELF")/afk-limits"
+  if [[ -x "$near" ]]; then "$near" --json 2>/dev/null || echo '{}'
+  else afk-limits --json 2>/dev/null || echo '{}'; fi
+}
+
+# limit_field session percent — поле из вывода afk-limits, лежащего в $LIMITS
+limit_field() {
+  python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.argv[1]) or {}
+    value = (data.get(sys.argv[2]) or {}).get(sys.argv[3])
+    print("" if value is None else value)
+except Exception:
+    print("")
+' "$LIMITS" "$1" "$2"
+}
+
+online() { curl -s -o /dev/null -m 8 https://api.anthropic.com/ 2>/dev/null; }
+
+journal() {
+  local file="$DIR/JOURNAL.md"
+  [[ -f "$file" ]] || return 0
+  printf '\n- %s — сторож: %s\n' "$(date '+%H:%M')" "$1" >> "$file"
+}
+
+# ── подъём работы ─────────────────────────────────────────────────────────────
+
+# Фоновая сессия переживает закрытый терминал, а утром `claude attach <id>`
+# возвращает её человеку в окно.
+start_session() {
+  local sid="$1" why="$2" args=() out id verdict
+
+  if [[ "$DRY" == 1 ]]; then
+    log "поднял бы работу заново ($why), контекст ${sid:-с чистого листа}"
+    return 0
+  fi
+
+  args=(--bg --permission-mode "$MODE")
+  [[ -f "$POLICY" ]] && args+=(--append-system-prompt-file "$POLICY")
+  [[ -n "$sid" ]] && args+=(--resume "$sid")
+  [[ -n "$MODEL" ]] && args+=(--model "$MODEL")
+
+  out=$(cd "$DIR" && claude "${args[@]}" "$RESUME_PROMPT" 2>&1 | head -3)
+  id=$(grep -oE 'backgrounded · [0-9a-f]+' <<< "$out" | awk '{print $3}' || true)
+
+  if [[ -z "$id" ]]; then
+    log "поднять не вышло: $(head -1 <<< "$out")"
+    return 1
+  fi
+
+  sleep 25
+  verdict="$(claude agents --json --all 2>/dev/null | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    rows = []
+for r in rows:
+    if r.get("id") == sys.argv[1]:
+        print("{}|{}".format(r.get("state", ""), r.get("sessionId", "")))
+        break
+' "$id" 2>/dev/null || true)"
+
+  if [[ "${verdict%%|*}" == failed ]]; then
+    if [[ -n "$sid" ]]; then
+      log "сессия не поднялась с прежним контекстом, начинаю по PLAN.md"
+      start_session "" "$why"
+      return
+    fi
+    log "сессия $id упала сразу после запуска"
+    return 1
+  fi
+
+  state_set resumes "$(( $(state_num resumes) + 1 ))"
+  state_set last_resume "$(now)"
+  [[ -n "${verdict#*|}" ]] && state_set resume_sid "${verdict#*|}"
+  log "работа поднята заново ($why) — сессия $id, утром «claude attach $id»"
+  journal "работа поднята заново ($why), сессия $id"
+}
+
+# Мягко закрыть то, что осталось от прежней сессии: две сессии в одном каталоге
+# правят одни и те же файлы.
+close_stalled() {
+  local kind pid sid status started name closed=0
+  while IFS='|' read -r kind pid sid status started name; do
+    [[ -z "$kind" ]] && continue
+    if [[ "$DRY" == 0 ]]; then
+      if [[ "$kind" == background ]]; then
+        claude stop "${sid:0:8}" >/dev/null 2>&1 || true
+      elif [[ "$pid" =~ ^[0-9]+$ ]]; then
+        kill -TERM "$pid" 2>/dev/null || true
+      fi
+    fi
+    log "закрыл вставшую сессию ${sid:0:8} ($kind)"
+    closed=1
+  done < <(sessions)
+  [[ "$DRY" == 0 && "$closed" == 1 ]] && sleep 3
+  return 0
+}
+
+# ── проверка ──────────────────────────────────────────────────────────────────
+
+SLEEP="$CHECK_SEC"
+LIMITS='{}'
+
+# 0 — следить дальше, 10 — сторожу закончить.
+tick() {
+  SLEEP="$CHECK_SEC"
+
+  if [[ -e "$AFKDIR/stop" ]]; then
+    log "работа закончена (.afk/stop), снимаюсь"
+    return 10
+  fi
+
+  local watch_start hb kind pid sid status started name
+  watch_start="$(state_num started)"
+
+  # Человек вернулся и работает сам — сторожу тут больше нечего делать. Ночные сессии
+  # `afk` зовёт «afk-<каталог>», так что ручную видно по имени.
+  while IFS='|' read -r kind pid sid status started name; do
+    [[ "$kind" == interactive ]] || continue
+    [[ "$name" == afk-* ]] && continue
+    [[ "$started" =~ ^[0-9]+$ ]] || continue
+    if (( started / 1000 > watch_start + 60 )); then
+      log "в каталоге появилась своя сессия «$name» — человек вернулся, снимаюсь"
+      return 10
+    fi
+  done < <(sessions)
+
+  # Пока сессия на месте, помним её контекст: с ним же её и поднимать.
+  sid="$(sessions | head -1 | cut -d'|' -f3)"
+  [[ -n "$sid" && "$sid" != "$(state_get resume_sid)" ]] && state_set resume_sid "$sid"
+
+  # Heartbeat может и не появиться — тогда отсчёт идёт от последнего события
+  # самого сторожа: заступил или поднимал работу.
+  hb=$(age_of "$AFKDIR/heartbeat")
+  if (( hb == 999999 )); then
+    local since="$watch_start"
+    (( $(state_num last_resume) > since )) && since="$(state_num last_resume)"
+    # Сторожа запускают в живой сессии; если отсчитывать не от чего, считаем,
+    # что молчание только что превысило порог.
+    (( since == 0 )) && since=$(( $(now) - IDLE_MIN * 60 - 60 ))
+    hb=$(( $(now) - since ))
+  fi
+
+  if (( hb < IDLE_MIN * 60 )); then
+    say "работа идёт, последний виток $(( hb / 60 )) мин назад"
+    return 0
+  fi
+
+  if ! online; then
+    log "связи нет — жду, работу не трогаю"
+    SLEEP=120
+    return 0
+  fi
+
+  LIMITS="$(limits)"
+  local s_pct s_left w_pct
+  s_pct="$(limit_field session percent)"
+  s_left="$(limit_field session resets_in_sec)"
+  w_pct="$(limit_field weekly percent)"
+
+  # Пятичасовое окно выбрано — ждём сброса. Данные могли устареть, поэтому
+  # прошедшее время сброса важнее процента.
+  if [[ "$s_pct" =~ ^[0-9]+$ ]] && (( s_pct >= 97 )) && [[ "$s_left" =~ ^[0-9]+$ ]] && (( s_left > 0 )); then
+    state_set hit_limit "$(now)"
+    log "пятичасовое окно выбрано ($s_pct%), сброс через $(( s_left / 60 )) мин — жду"
+    SLEEP=$(( s_left + 60 )); (( SLEEP > 1800 )) && SLEEP=1800
+    return 0
+  fi
+
+  if [[ "$w_pct" =~ ^[0-9]+$ ]] && (( w_pct >= WEEKLY_FLOOR )); then
+    log "недельный кап на исходе ($w_pct%) — не поднимаю, остаток оставляю человеку"
+    journal "работа не возобновлена: недельный кап $w_pct%, оставил запас на утро"
+    return 10
+  fi
+
+  local resumes last
+  resumes="$(state_num resumes)"
+  last="$(state_num last_resume)"
+
+  if (( resumes >= MAX_RESUMES )); then
+    log "поднимал уже $resumes раз — без человека дальше смысла нет, снимаюсь"
+    journal "работа вставала $resumes раз, сторож снялся"
+    return 10
+  fi
+
+  if (( $(now) - last < 900 )); then
+    say "поднимал $(( ($(now) - last) / 60 )) мин назад, даю сессии время"
+    return 0
+  fi
+
+  local why="сессия молчит $(( hb / 60 )) мин"
+  [[ -n "$(state_get hit_limit)" ]] && why="лимит открылся"
+
+  close_stalled
+  start_session "$(state_get resume_sid)" "$why" || true
+  state_set hit_limit ""
+  return 0
+}
+
+# ── действия ──────────────────────────────────────────────────────────────────
+
+case "$ACTION" in
+  start)
+    if systemctl --user is-active --quiet "$UNIT.service" 2>/dev/null; then
+      say "сторож уже приставлен к $DIR"
+      exit 0
+    fi
+    mkdir -p "$AFKDIR"
+    rm -f "$AFKDIR/stop"
+    state_set started "$(now)"
+    state_set resumes 0
+    state_set last_resume 0
+    state_set hit_limit ""
+    state_set resume_sid "$(sessions | head -1 | cut -d'|' -f3)"
+    [[ -n "$MODEL" ]] && state_set model "$MODEL"
+
+    # Служебные файлы сторожа не должны попадать в ночные коммиты.
+    if [[ -d "$DIR/.git" ]] && ! grep -qs '^\.afk/$' "$DIR/.git/info/exclude"; then
+      mkdir -p "$DIR/.git/info" && echo '.afk/' >> "$DIR/.git/info/exclude"
+    fi
+
+    systemd-run --user --unit "$UNIT" --collect \
+      --description "Сторож ночной сессии Claude Code в $DIR" \
+      --setenv="AFK_IDLE_MIN=$IDLE_MIN" \
+      --setenv="AFK_WEEKLY_FLOOR=$WEEKLY_FLOOR" \
+      --setenv="AFK_MAX_RESUMES=$MAX_RESUMES" \
+      --setenv="AFK_CHECK_SEC=$CHECK_SEC" \
+      --setenv="AFK_PERMISSION_MODE=$MODE" \
+      --setenv="AFK_MODEL=$MODEL" \
+      --setenv="PATH=$PATH" \
+      systemd-inhibit --what=idle:sleep:handle-lid-switch \
+        --who=afk-watch --why="ночная работа Claude Code" \
+        "$SELF" --daemon --dir "$DIR" >/dev/null
+    say "сторож приставлен к $DIR: ждёт .afk/heartbeat, поднимает работу после лимита и обрыва связи."
+    say "посмотреть — afk-watch --status, снять — afk-watch --stop"
+    ;;
+
+  stop)
+    systemctl --user stop "$UNIT.service" 2>/dev/null || true
+    systemctl --user reset-failed "$UNIT.service" 2>/dev/null || true
+    say "сторож снят с $DIR"
+    ;;
+
+  status)
+    if systemctl --user is-active --quiet "$UNIT.service" 2>/dev/null; then
+      say "сторож работает (юнит $UNIT)"
+    else
+      say "сторожа нет (юнит $UNIT не запущен)"
+    fi
+    hb=$(age_of "$AFKDIR/heartbeat")
+    if (( hb == 999999 )); then say "heartbeat не появлялся"; else say "последний виток $(( hb / 60 )) мин назад"; fi
+    resumes="$(state_num resumes)"
+    (( resumes > 0 )) && say "работа поднималась заново $resumes раз"
+    [[ -f "$LOGFILE" ]] && { say ""; tail -5 "$LOGFILE"; }
+    ;;
+
+  once)
+    tick || true
+    ;;
+
+  daemon)
+    log "сторож заступил: молчание дольше $IDLE_MIN мин — разбираюсь и поднимаю"
+    while :; do
+      set +e; tick; rc=$?; set -e
+      (( rc == 10 )) && break
+      sleep "$SLEEP"
+    done
+    log "сторож снялся"
+    ;;
+esac
