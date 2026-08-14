@@ -160,6 +160,25 @@ def check_bash(command, cwd, home):
             here = resolve(args[0], here)
             continue
 
+        # Хранилища секретов: печатать токен в терминал ночью незачем.
+        if (name == "gh" and args[:2] == ["auth", "token"]) or \
+           name in ("secret-tool", "keyring") or \
+           (name == "pass" and "show" in args) or \
+           (name == "security" and "find-generic-password" in args):
+            return "deny", "выдача учётных данных"
+
+        # Отправка файла наружу: curl/wget с @файлом за пределами проекта.
+        if name in ("curl", "wget"):
+            for arg in args:
+                if "@" not in arg:
+                    continue
+                candidate = arg.split("@", 1)[1]
+                if not candidate or candidate.startswith(("http", "-")):
+                    continue
+                target = resolve(candidate, here)
+                if os.path.sep in candidate and not inside(target, project):
+                    return "deny", f"отправка наружу файла вне проекта ({target})"
+
         if name == "git":
             flat = " ".join(args)
             if re.search(r"\bpush\b", flat):
@@ -218,10 +237,15 @@ def main() -> int:
     tool = event.get("tool_name", "")
     data = event.get("tool_input") or {}
 
-    # Пути, по которым инструмент works — но не то, что он пишет внутрь файла,
-    # и не то, что ищет: искать упоминание ключа в своём коде ночью можно.
-    paths = " ".join(str(data.get(key, "")) for key in
-                     ("file_path", "notebook_path", "path", "command"))
+    # У встроенных инструментов смотрим на то, с чем они работают: путь и команду.
+    # Содержимое не трогаем — иначе ночью не написать ни скрипта, ни документации,
+    # где такой путь просто упомянут. У инструментов MCP имена полей заранее
+    # неизвестны, поэтому там приходится смотреть на всё подряд.
+    if tool.startswith("mcp__"):
+        paths = json.dumps(data, ensure_ascii=False)
+    else:
+        paths = " ".join(str(data.get(key, "")) for key in
+                         ("file_path", "notebook_path", "path", "command"))
     for pattern in SECRETS:
         if re.search(pattern, paths):
             emit("deny", "ключи и учётные данные ночью не трогаем — запиши в BLOCKED.md",
