@@ -57,6 +57,21 @@ LOGFILE="$AFKDIR/watch.log"
 SLUG="$(printf '%s' "$(basename "$DIR")" | tr -c 'A-Za-z0-9_-' '-')-$(printf '%s' "$DIR" | sha1sum | cut -c1-8)"
 UNIT="afk-watch-$SLUG"
 
+# Юнит ищем по каталогу в описании, а не только по имени: имя строится из пути,
+# и любое изменение схемы (или переименование каталога) осиротило бы уже
+# работающего сторожа — он остался бы жив, но снять его было бы нечем.
+running_unit() {
+  local u
+  while read -r u; do
+    [[ -n "$u" ]] || continue
+    if systemctl --user show "$u" -p Description --value 2>/dev/null | grep -qF " в $DIR"; then
+      printf '%s\n' "${u%.service}"
+      return 0
+    fi
+  done < <(systemctl --user list-units 'afk-watch-*' --no-legend --plain 2>/dev/null | awk '{print $1}')
+  return 1
+}
+
 # ── мелочи ────────────────────────────────────────────────────────────────────
 
 say() { printf '%s\n' "$*"; }
@@ -448,7 +463,7 @@ tick() {
 
 case "$ACTION" in
   start)
-    if systemctl --user is-active --quiet "$UNIT.service" 2>/dev/null; then
+    if running_unit >/dev/null; then
       say "сторож уже приставлен к $DIR"
       exit 0
     fi
@@ -494,13 +509,14 @@ case "$ACTION" in
     ;;
 
   stop)
+    UNIT="$(running_unit || echo "$UNIT")"
     systemctl --user stop "$UNIT.service" 2>/dev/null || true
     systemctl --user reset-failed "$UNIT.service" 2>/dev/null || true
     say "сторож снят с $DIR"
     ;;
 
   status)
-    if systemctl --user is-active --quiet "$UNIT.service" 2>/dev/null; then
+    if UNIT="$(running_unit)"; then
       say "сторож работает (юнит $UNIT)"
     else
       say "сторожа нет (юнит $UNIT не запущен)"

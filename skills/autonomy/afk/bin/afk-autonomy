@@ -86,11 +86,20 @@ with open(path, "w") as f:
 PY
 }
 
+# Поднятой сторожем сессии харнесс запрещает править файлы в общем чекауте — требует
+# отдельный worktree. Для ночной работы это бессмысленно: правки уедут в сторону от
+# проекта. Прежнее значение запоминаем, чтобы утром вернуть как было.
+bg_isolation() {
+  MODE_ARG="$1" STATE_DIR="$STATE_DIR" python3 "$(dirname "$(readlink -f "$0")")/../hook/bg-isolation.py" \
+    "$HOME/.claude/settings.local.json"
+}
+
 case "$ACTION" in
   on)
     mkdir -p "$STATE_DIR" "$DIR/.afk"
     listed || printf '%s\n' "$DIR" >> "$DIRS_FILE"
     ensure_hook
+    bg_isolation on
     echo "автономность включена: разрешения больше не останавливают работу в $DIR"
     echo "опасное (ключи, sudo, форс-пуш, rm -rf вне проекта) хук по-прежнему отклоняет"
     ;;
@@ -110,6 +119,7 @@ case "$ACTION" in
     fi
     # Сам хук остаётся в настройках: без каталогов он молчит, а поставленный заранее
     # переживает начало следующей ночи — добавленный на лету сессия может не принять.
+    [[ -s "$DIRS_FILE" ]] || bg_isolation off
     echo "автономность выключена для $DIR"
     ;;
 
