@@ -73,6 +73,14 @@ CASES = [
     ("deny", "Bash", {"command": "mkfs.ext4 /dev/sda1"}, "разметка устройства"),
     ("deny", "Bash", {"command": f"cp -r {HOME}/.s" + "sh /tmp/backup"}, "копирование каталога с ключами"),
     ("deny", "Read", {"file_path": KEY}, "чтение ключа"),
+
+    # устойчивость разбора: странный ввод не должен ни ронять хук, ни отказывать зря
+    ("allow", "Bash", {"command": ""}, "пустая команда"),
+    ("allow", "Bash", {"command": "echo 'незакрытая кавычка"}, "незакрытая кавычка"),
+    ("allow", "Bash", {"command": "make build \\\n && make test"}, "перенос строки"),
+    ("allow", "Bash", {"command": "echo $(date) > out.txt"}, "подстановка команды"),
+    ("allow", "Bash", {"command": "git log --format='%h %s' | head -20"}, "конвейер с форматом"),
+    ("allow", "Bash", {"command": "npm run build 2>&1 | tee build.log"}, "tee с редиректом"),
     ("deny", "mcp__files__read", {"target": KEY}, "тот же ключ через инструмент MCP"),
     ("allow", "mcp__browser__navigate_page", {"url": "https://example.com/docs"}, "обычный вызов MCP"),
     ("deny", "Bash", {"command": "gh auth token"}, "выдача токена"),
