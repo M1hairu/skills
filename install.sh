@@ -13,6 +13,7 @@
 #   --dry-run                     — показать, что произойдёт, и ничего не делать
 #   --force                       — заменить мешающие реальные файлы (старое в бэкап)
 #   --uninstall                   — снять симлинки, ведущие в этот репозиторий
+#   -y, --yes                     — доставить недостающие пакеты без вопроса
 #
 # Ставится симлинками, а не копиями: правка файла в репозитории действует
 # сразу, без переустановки, а `git pull` обновляет все поставленные скиллы разом.
@@ -23,6 +24,7 @@
 #   skills/<категория>/<имя>/bin/*      → команды, по одной в ~/.local/bin/
 #   skills/<категория>/<имя>/claude/*   → файлы окружения Claude, в ~/.claude/
 #   skills/<категория>/<имя>/permissions.json, hooks.json → в ~/.claude/settings.json
+#   skills/<категория>/<имя>/requires.txt → команды, которых не хватает в системе
 #
 # Область — либо ~/.claude (глобально), либо <проект>/.claude (--local). Команды и файлы
 # окружения ставятся глобально в любом случае: $PATH один на систему, и скрипты скиллов
@@ -42,6 +44,7 @@ BACKUP_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/claude-skills/backups"
 
 DRY=0
 FORCE=0
+ASSUME_YES=0
 UNINSTALL=0
 LIST=0
 PICK=0
@@ -52,6 +55,7 @@ WANTED=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run|-n) DRY=1; shift ;;
+    --yes|-y)     ASSUME_YES=1; shift ;;
     --force|-f)   FORCE=1; shift ;;
     --uninstall)  UNINSTALL=1; shift ;;
     --list|-l)    LIST=1; shift ;;
@@ -199,6 +203,62 @@ settings_rules() {
   return 0
 }
 
+# ── чего скиллу не хватает в системе ──
+# requires.txt перечисляет команды, без которых скилл работает не полностью.
+# Установщик их проверяет и предлагает доставить пакетным менеджером — молча
+# пропускать нельзя: недостающий tmux, например, стоит скиллу целой ночи.
+INSTALL_CMD=""
+detect_pm() {
+  [[ -n "$INSTALL_CMD" ]] && return 0
+  if   command -v pacman  >/dev/null; then INSTALL_CMD="sudo pacman -S --needed"
+  elif command -v apt-get >/dev/null; then INSTALL_CMD="sudo apt-get install -y"
+  elif command -v dnf     >/dev/null; then INSTALL_CMD="sudo dnf install -y"
+  elif command -v zypper  >/dev/null; then INSTALL_CMD="sudo zypper install -y"
+  elif command -v apk     >/dev/null; then INSTALL_CMD="sudo apk add"
+  elif command -v brew    >/dev/null; then INSTALL_CMD="brew install"
+  fi
+}
+
+# Вопрос человеку, когда установщик запущен руками.
+ask() {
+  local answer
+  printf '%s [y/N] ' "$1"
+  read -r answer || answer=""
+  [[ "$answer" =~ ^[YyДд] ]]
+}
+
+check_requires() {
+  local dir="$1" file="$1/requires.txt" line cmd why missing=()
+  [[ -f "$file" ]] || return 0
+
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*# || -z "${line// }" ]] && continue
+    cmd="${line%%[[:space:]]*}"
+    why="${line#*— }"
+    command -v "$cmd" >/dev/null && continue
+    missing+=("$cmd")
+    warn "нет $cmd — $why"
+  done < "$file"
+
+  (( ${#missing[@]} )) || return 0
+  detect_pm
+  if [[ -z "$INSTALL_CMD" ]]; then
+    say "  поставь сам: ${missing[*]}"
+    return 0
+  fi
+  if (( DRY )); then
+    say "  поставил бы: $INSTALL_CMD ${missing[*]}"
+    return 0
+  fi
+  if (( ASSUME_YES )) || { [[ -t 0 ]] && ask "  поставить сейчас ($INSTALL_CMD ${missing[*]})?"; }; then
+    # shellcheck disable=SC2086
+    $INSTALL_CMD "${missing[@]}" && ok "доставлено: ${missing[*]}"
+  else
+    say "  без них скилл работает не полностью: $INSTALL_CMD ${missing[*]}"
+  fi
+  return 0
+}
+
 install_skill() {
   local rel="$1" dir="$SKILLS_DIR/$1" name="${1##*/}" f d
   say "$rel"
@@ -221,6 +281,7 @@ install_skill() {
   fi
 
   settings_rules "$dir" add
+  check_requires "$dir"
 }
 
 uninstall_skill() {

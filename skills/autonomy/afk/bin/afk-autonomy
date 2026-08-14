@@ -78,38 +78,59 @@ def verdict(decision, reason):
 
 tool = event.get("tool_name", "")
 data = event.get("tool_input") or {}
-text = " ".join(str(v) for v in data.values() if isinstance(v, (str, int, float)))
+
+# Смотрим на то, с чем инструмент работает: путь к файлу и саму команду.
+# Содержимое не проверяем — иначе ночью не написать ни скрипта, ни документации,
+# где такой путь просто упомянут.
+targets = " ".join(str(data.get(key, "")) for key in
+                   ("file_path", "notebook_path", "path", "command", "pattern", "url"))
 
 # Секреты: ночью их не читают и не правят, даже когда очень надо.
 SECRETS = (r"\.ssh/", r"\.gnupg", r"\.aws/", r"\.netrc", r"\.git-credentials",
            r"\.credentials\.json", r"\.config/sing-box", r"id_(rsa|ed25519|ecdsa)")
 for pattern in SECRETS:
-    if re.search(pattern, text):
+    if re.search(pattern, targets):
         verdict("deny", "ключи и учётные данные ночью не трогаем — запиши в BLOCKED.md")
 
 if tool == "Bash":
     command = str(data.get("command", ""))
-    DANGEROUS = (
-        (r"\bsudo\b", "sudo без человека"),
-        (r"\bmkfs|\bdd\s+if=.*of=/dev/", "запись на устройство"),
-        (r"git\s+push\s+\S*\s*(--force|-f)\b", "форс-пуш"),
-        (r"\bshutdown\b|\breboot\b|\bsystemctl\s+(poweroff|reboot)", "выключение машины"),
-        (r":\(\)\{.*\};:", "форк-бомба"),
-    )
-    for pattern, why in DANGEROUS:
-        if re.search(pattern, command):
-            verdict("deny", f"{why} — не ночью; опиши в BLOCKED.md и иди дальше")
 
-    # Рекурсивно удалять можно только у себя в проекте и во временных файлах:
-    # ошибка в пути ночью стоит чужих данных.
-    if re.search(r"\brm\b", command) and re.search(r"\s-[a-zA-Z]*[rR]", command):
-        outside = []
-        for target in re.findall(r"(?<![\w/=])(~[^\s;|&]*|/[^\s;|&]*)", command):
-            full = os.path.expanduser(target)
-            if not (full.startswith(cwd.rstrip("/") + "/") or full.startswith("/tmp/")):
-                outside.append(target)
-        if outside:
-            verdict("deny", f"рекурсивное удаление вне проекта ({outside[0]}) — не ночью")
+    if re.search(r":\(\)\{.*\};:", command):
+        verdict("deny", "форк-бомба — не ночью")
+
+    # Опасное ищем среди исполняемых команд, а не по всей строке: ночью пишутся
+    # скрипты и документация, где те же слова стоят просто текстом.
+    DANGEROUS = (
+        (r"^(sudo|doas)\b", "запуск от root"),
+        (r"^(mkfs|dd)\b.*of=/dev/", "запись на устройство"),
+        (r"^git\s+push\b.*(--force|-f)\b", "форс-пуш"),
+        (r"^(shutdown|reboot|halt|poweroff)\b", "выключение машины"),
+        (r"^systemctl\s+(poweroff|reboot|halt)\b", "выключение машины"),
+    )
+    for part in re.split(r"[;&|\n]+", command):
+        part = part.strip().lstrip("(){ \t")
+        if not part:
+            continue
+        for pattern, why in DANGEROUS:
+            if re.search(pattern, part):
+                verdict("deny", f"{why} — не ночью; опиши в BLOCKED.md и иди дальше")
+
+        # Рекурсивно удалять можно только у себя в проекте и во временных файлах:
+        # ошибка в пути ночью стоит чужих данных.
+        if re.match(r"^rm\b", part) and re.search(r"\s-[a-zA-Z]*[rR]", part):
+            home = os.path.expanduser("~").rstrip("/")
+            outside = []
+            for target in re.findall(r"(?<![\w/=])(~[^\s]*|/[^\s]*)", part):
+                full = os.path.expanduser(target).rstrip("/")
+                # Домашний каталог и всё, что лежит в нём непосредственно, — не
+                # «файлы проекта», даже когда сессия запущена прямо из ~.
+                if full == home or (full.startswith(home + "/")
+                                    and full.count("/") - home.count("/") <= 1):
+                    outside.append(target)
+                elif not (full.startswith(cwd.rstrip("/") + "/") or full.startswith("/tmp/")):
+                    outside.append(target)
+            if outside:
+                verdict("deny", f"рекурсивное удаление вне проекта ({outside[0]}) — не ночью")
 
 verdict("allow", "режим AFK: разрешения не останавливают работу")
 ' "$DIRS_FILE"

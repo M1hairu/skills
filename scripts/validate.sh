@@ -117,6 +117,19 @@ check_skill() {
       || err "не упомянут в skills/$category/README.md"
   fi
 
+  # ── свои проверки скилла ──
+  # Скилл, у которого есть что проверить (правила хука, разбор вывода), кладёт
+  # это в tests/run.sh. Молчаливая поломка таких правил дороже всего.
+  if [[ -x "$dir/tests/run.sh" ]]; then
+    local out
+    if out=$("$dir/tests/run.sh" 2>&1); then
+      printf '  %s✓%s tests/run.sh —%s\n' "$c_ok" "$c_off" "$(tail -1 <<< "$out")"
+    else
+      err "tests/run.sh не прошёл:"
+      printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+  fi
+
   # ── личные данные ──
   while IFS= read -r f; do scan_secrets "$f"; done < <(find "$dir" -type f \
       \( -name '*.md' -o -name '*.sh' -o -path '*/bin/*' \) ! -name '*.example*')

@@ -184,8 +184,8 @@ nudge_session() {
     log "написал бы во вставшее окно tmux «$target»"
     return 0
   fi
-  # Esc снимает подвисший ввод, дальше обычная строка и перевод строки.
-  tmux send-keys -t "$target" Escape 2>/dev/null || true
+  # Только текст и перевод строки. Escape тут опасен: он отменяет диалоги,
+  # а на диалоге доверия к каталогу — просто закрывает Claude Code.
   tmux send-keys -t "$target" "$NUDGE_TEXT" 2>/dev/null || return 1
   tmux send-keys -t "$target" Enter 2>/dev/null || return 1
   state_set nudged "$(now)"
