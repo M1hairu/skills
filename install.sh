@@ -197,7 +197,11 @@ settings_rules() {
     if (( DRY )); then
       ok "$(short "$settings") — $kind скилла"; continue
     fi
-    changed=$(python3 "$REPO/scripts/settings-merge.py" "$kind" "$file" "$settings" "$mode")
+    local own=()
+    if [[ -d "$dir/bin" ]]; then
+      for f in "$dir"/bin/*; do [[ -f "$f" ]] && own+=("$(basename "$f")"); done
+    fi
+    changed=$(python3 "$REPO/scripts/settings-merge.py" "$kind" "$file" "$settings" "$mode" "${own[@]}")
     [[ -n "$changed" ]] && ok "$(short "$settings") — $kind скилла"
   done
   return 0

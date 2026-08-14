@@ -3,7 +3,11 @@
     {
       "matcher": "*",
       "hooks": [
-        { "type": "command", "command": "afk-autonomy --hook", "timeout": 10 }
+        {
+          "type": "command",
+          "command": "afk-hook",
+          "timeout": 10
+        }
       ]
     }
   ]

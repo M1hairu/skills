@@ -7,13 +7,13 @@
 #
 # Режим сессии (`manual`, `acceptEdits`) на ходу не меняется — он задаётся при запуске
 # процесса. Зато хуки Claude Code перечитывает на лету, а хук `PreToolUse` умеет сам
-# выдавать разрешение. Поэтому в `~/.claude/settings.local.json` ставится хук, который
+# выдавать разрешение. Поэтому в настройки Claude Code ставится хук, который
 # отвечает «allow» — но только для каталогов из `~/.local/state/afk/autonomy-dirs`.
 # В остальных местах он молчит, и разрешения работают как обычно.
 #
-# Опасное хук отклоняет и ночью: ключи и учётные данные, `sudo`, форс-пуш, рекурсивное
-# удаление вне проекта. Этим он лучше `--dangerously-skip-permissions`, где не действует
-# даже `permissions.deny`.
+# Очевидно опасное хук отклоняет и ночью: ключи и учётные данные, запуск от root,
+# форс-пуш, рекурсивное удаление вне проекта. Это подстраховка от глупости, а не
+# песочница: команду можно записать так, что разбор её не узнает.
 
 set -euo pipefail
 
@@ -33,113 +33,30 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ── решение по конкретному вызову инструмента ─────────────────────────────────
-# Так скрипт зовёт сам Claude Code: на stdin JSON вызова, на stdout — вердикт.
-# Молчание значит «решай как обычно», поэтому днём и в чужих каталогах хук ничего
-# не меняет.
+# ── решение по вызову инструмента ─────────────────────────────────────────────
+# Правила живут в hook/decide.py, зовёт их afk-hook. Здесь остаётся переходник:
+# у тех, кто ставил скилл раньше, в настройках прописан «afk-autonomy --hook».
 if [[ "$ACTION" == hook ]]; then
-  # Код передаётся через -c, а не heredoc: stdin занят самим вызовом инструмента.
-  exec python3 -c '
-import json, os, re, sys
-
-dirs_file = sys.argv[1]
-
-try:
-    event = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-
-cwd = event.get("cwd") or os.getcwd()
-try:
-    with open(dirs_file) as f:
-        watched = [line.strip() for line in f if line.strip()]
-except Exception:
-    watched = []
-
-if not any(cwd == d or cwd.startswith(d.rstrip("/") + "/") for d in watched):
-    sys.exit(0)
-
-
-def verdict(decision, reason):
-    # Журнал решений: утром по нему видно, что хук отклонял ночью.
-    try:
-        if decision != "allow" or os.path.exists(os.path.join(cwd, ".afk", "hook.debug")):
-            with open(os.path.join(cwd, ".afk", "hook.log"), "a") as log:
-                log.write("{} {} {}\n".format(decision, event.get("tool_name", "?"), reason))
-    except Exception:
-        pass
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": decision,
-        "permissionDecisionReason": reason,
-    }}, ensure_ascii=False))
-    sys.exit(0)
-
-
-tool = event.get("tool_name", "")
-data = event.get("tool_input") or {}
-
-# Смотрим на то, с чем инструмент работает: путь к файлу и саму команду.
-# Содержимое не проверяем — иначе ночью не написать ни скрипта, ни документации,
-# где такой путь просто упомянут.
-targets = " ".join(str(data.get(key, "")) for key in
-                   ("file_path", "notebook_path", "path", "command", "pattern", "url"))
-
-# Секреты: ночью их не читают и не правят, даже когда очень надо.
-SECRETS = (r"\.ssh/", r"\.gnupg", r"\.aws/", r"\.netrc", r"\.git-credentials",
-           r"\.credentials\.json", r"\.config/sing-box", r"id_(rsa|ed25519|ecdsa)")
-for pattern in SECRETS:
-    if re.search(pattern, targets):
-        verdict("deny", "ключи и учётные данные ночью не трогаем — запиши в BLOCKED.md")
-
-if tool == "Bash":
-    command = str(data.get("command", ""))
-
-    if re.search(r":\(\)\{.*\};:", command):
-        verdict("deny", "форк-бомба — не ночью")
-
-    # Опасное ищем среди исполняемых команд, а не по всей строке: ночью пишутся
-    # скрипты и документация, где те же слова стоят просто текстом.
-    DANGEROUS = (
-        (r"^(sudo|doas)\b", "запуск от root"),
-        (r"^(mkfs|dd)\b.*of=/dev/", "запись на устройство"),
-        (r"^git\s+push\b.*(--force|-f)\b", "форс-пуш"),
-        (r"^(shutdown|reboot|halt|poweroff)\b", "выключение машины"),
-        (r"^systemctl\s+(poweroff|reboot|halt)\b", "выключение машины"),
-    )
-    for part in re.split(r"[;&|\n]+", command):
-        part = part.strip().lstrip("(){ \t")
-        if not part:
-            continue
-        for pattern, why in DANGEROUS:
-            if re.search(pattern, part):
-                verdict("deny", f"{why} — не ночью; опиши в BLOCKED.md и иди дальше")
-
-        # Рекурсивно удалять можно только у себя в проекте и во временных файлах:
-        # ошибка в пути ночью стоит чужих данных.
-        if re.match(r"^rm\b", part) and re.search(r"\s-[a-zA-Z]*[rR]", part):
-            home = os.path.expanduser("~").rstrip("/")
-            outside = []
-            for target in re.findall(r"(?<![\w/=])(~[^\s]*|/[^\s]*)", part):
-                full = os.path.expanduser(target).rstrip("/")
-                # Домашний каталог и всё, что лежит в нём непосредственно, — не
-                # «файлы проекта», даже когда сессия запущена прямо из ~.
-                if full == home or (full.startswith(home + "/")
-                                    and full.count("/") - home.count("/") <= 1):
-                    outside.append(target)
-                elif not (full.startswith(cwd.rstrip("/") + "/") or full.startswith("/tmp/")):
-                    outside.append(target)
-            if outside:
-                verdict("deny", f"рекурсивное удаление вне проекта ({outside[0]}) — не ночью")
-
-verdict("allow", "режим AFK: разрешения не останавливают работу")
-' "$DIRS_FILE"
+  SELF="$(readlink -f "$0")"
+  exec "$(dirname "$SELF")/afk-hook"
 fi
 
 [[ -n "$ACTION" ]] || ACTION=status
 
 SELF="$(readlink -f "$0")"
 command -v afk-autonomy >/dev/null && SELF="afk-autonomy"
+
+# Хук пускает по вложенности, поэтому и здесь смотрим так же: автономность,
+# включённая для каталога выше, действует и тут. Печатает каталог, который её даёт.
+covering_dir() {
+  [[ -f "$DIRS_FILE" ]] || return 1
+  local d best=""
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    if [[ "$DIR" == "$d" || "$DIR" == "$d"/* ]] && (( ${#d} > ${#best} )); then best="$d"; fi
+  done < "$DIRS_FILE"
+  [[ -n "$best" ]] && printf '%s\n' "$best"
+}
 
 listed() { [[ -f "$DIRS_FILE" ]] && grep -qxF "$DIR" "$DIRS_FILE"; }
 
@@ -151,7 +68,7 @@ ensure_hook() {
 import json, os, sys
 
 path = sys.argv[1]
-command = f"{os.environ['SELF']} --hook"
+command = "afk-hook"
 try:
     with open(path) as f:
         data = json.load(f)
@@ -179,6 +96,14 @@ case "$ACTION" in
     ;;
 
   off)
+    COVER="$(covering_dir || true)"
+    if [[ -n "$COVER" && "$COVER" != "$DIR" ]]; then
+      # Молча «выключить» то, что включено каталогом выше, — обман: человек уйдёт
+      # уверенным, что режим снят, а хук продолжит раздавать разрешения.
+      echo "автономность включена не для этого каталога, а для $COVER"
+      echo "снять её: afk-autonomy --off --dir $COVER"
+      exit 1
+    fi
     if [[ -f "$DIRS_FILE" ]]; then
       grep -vxF "$DIR" "$DIRS_FILE" > "$DIRS_FILE.tmp" 2>/dev/null || true
       mv "$DIRS_FILE.tmp" "$DIRS_FILE"
@@ -189,9 +114,15 @@ case "$ACTION" in
     ;;
 
   status)
-    if listed; then
-      echo "автономность включена для $DIR"
-      [[ -f "$DIR/.afk/hook.log" ]] && { echo "последнее отклонённое:"; tail -3 "$DIR/.afk/hook.log"; }
+    COVER="$(covering_dir || true)"
+    if [[ -n "$COVER" ]]; then
+      if [[ "$COVER" == "$DIR" ]]; then
+        echo "автономность включена для $DIR"
+      else
+        echo "автономность включена для $COVER — и действует здесь тоже"
+      fi
+      LOG="${COVER:-$DIR}/.afk/hook.log"
+      [[ -f "$LOG" ]] && { echo "последнее отклонённое:"; tail -3 "$LOG"; }
     else
       echo "автономность выключена для $DIR"
     fi

@@ -9,4 +9,4 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec python3 "$HERE/hook-cases.py" "$HERE/../bin/afk-autonomy"
+exec python3 "$HERE/hook-cases.py" "$HERE/../bin/afk-hook"

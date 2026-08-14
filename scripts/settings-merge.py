@@ -2,13 +2,14 @@
 """Правила разрешений и хуки скилла в настройках Claude Code.
 
     settings-merge.py permissions <permissions.json> <settings.json> add|remove
-    settings-merge.py hooks       <hooks.json>       <settings.json> add|remove
+    settings-merge.py hooks       <hooks.json>       <settings.json> add|remove [команды скилла…]
 
 Печатает «да», если файл настроек изменился, и молчит, если всё уже на месте.
 Вызывается из install.sh; руками обычно не нужен.
 """
 
 import json
+import os
 import sys
 
 
@@ -45,12 +46,28 @@ def merge_permissions(rules, data, mode):
             data.pop("permissions", None)
 
 
-def merge_hooks(rules, data, mode):
+def merge_hooks(rules, data, mode, own=()):
     if not isinstance(rules, dict):
         print("ожидался объект вида {событие: [группы хуков]}", file=sys.stderr)
         raise SystemExit(2)
 
+    def is_ours(group):
+        """Группа зовёт команду этого же скилла — значит она наша, пусть и старая."""
+        for entry in group.get("hooks", []):
+            command = str(entry.get("command", "")).strip()
+            head = os.path.basename(command.split()[0]) if command.split() else ""
+            if head in own:
+                return True
+        return False
+
     hooks = data.setdefault("hooks", {})
+    # Свои прежние записи убираем всегда: иначе после переименования команды
+    # в настройках остаются две, и хук запускается дважды на каждый вызов.
+    if own:
+        for event in list(hooks):
+            hooks[event] = [g for g in hooks[event] if not is_ours(g)]
+            if not hooks[event]:
+                hooks.pop(event)
     for event, groups in rules.items():
         current = hooks.setdefault(event, [])
         for group in groups:
@@ -68,6 +85,7 @@ def merge_hooks(rules, data, mode):
 
 def main() -> int:
     kind, rules_file, settings_file, mode = sys.argv[1:5]
+    own = set(sys.argv[5:])
 
     rules = load(rules_file, None)
     if rules is None:
@@ -79,7 +97,7 @@ def main() -> int:
     if kind == "permissions":
         merge_permissions(rules, data, mode)
     elif kind == "hooks":
-        merge_hooks(rules, data, mode)
+        merge_hooks(rules, data, mode, own)
     else:
         print(f"неизвестный раздел настроек: {kind}", file=sys.stderr)
         return 2

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Решение ночного хука по одному вызову инструмента.
+#
+#   afk-hook            — событие на stdin, вердикт на stdout
+#
+# Так его зовёт Claude Code (запись в ~/.claude/settings.json ставит установщик).
+# Руками обычно не нужен; правила и их проверка — рядом, в hook/decide.py
+# и tests/hook-cases.py.
+
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+DECIDE="$(dirname "$SELF")/../hook/decide.py"
+DIRS_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/afk/autonomy-dirs"
+
+[[ -f "$DECIDE" ]] || exit 0   # нет правил рядом — значит решать как обычно
+
+exec python3 "$DECIDE" "$DIRS_FILE"
