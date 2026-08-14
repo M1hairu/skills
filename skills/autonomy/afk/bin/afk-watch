@@ -141,6 +141,10 @@ start_session() {
     return 0
   fi
 
+  # Без автономности поднятая сессия немая: в dontAsk любая команда, требующая
+  # разрешения, молча отклоняется, и работа не двигается.
+  command -v afk-autonomy >/dev/null && afk-autonomy --on --dir "$DIR" >/dev/null 2>&1 || true
+
   args=(--bg --permission-mode "$MODE")
   [[ -f "$POLICY" ]] && args+=(--append-system-prompt-file "$POLICY")
   [[ -n "$sid" ]] && args+=(--resume "$sid")
@@ -303,6 +307,24 @@ tick() {
   if (( $(now) - last < 900 )); then
     say "поднимал $(( ($(now) - last) / 60 )) мин назад, даю сессии время"
     return 0
+  fi
+
+  # Поднялась, но за всё это время не подала голоса — значит подъём не лечит:
+  # чаще всего сессии не дают работать разрешения.
+  if (( last > 0 )); then
+    local hb_at dead
+    hb_at=$(stat -c %Y "$AFKDIR/heartbeat" 2>/dev/null || echo 0)
+    if (( hb_at < last )); then
+      dead=$(( $(state_num dead_resumes) + 1 ))
+      state_set dead_resumes "$dead"
+      if (( dead >= 2 )); then
+        log "поднятая сессия не подаёт признаков жизни — похоже, работать ей не дают разрешения (afk-autonomy --status); снимаюсь"
+        journal "подъём не помогает: поднятая сессия молчит. Проверь «afk-autonomy --status» и подними работу сам"
+        return 10
+      fi
+    else
+      state_set dead_resumes 0
+    fi
   fi
 
   local why="сессия молчит $(( hb / 60 )) мин"
