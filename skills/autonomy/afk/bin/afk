@@ -10,7 +10,8 @@
 #   afk --no-watch "..."      — без сторожа, который поднимает работу после лимита и обрыва связи
 #   afk --no-tmux "..."       — не держать окно в tmux (тогда оборванную сессию не разбудить)
 #
-# Ноутбук не уснёт и не среагирует на закрытие крышки, пока сеанс жив.
+# Ноутбук не уснёт и не среагирует на закрытие крышки, пока сеанс жив. Экран при этом
+# гаснет как обычно: работе он не нужен, а на OLED за ночь выгорает.
 
 set -euo pipefail
 
@@ -80,7 +81,7 @@ if [[ "$TMUX_OK" == 1 ]] && command -v tmux >/dev/null && [[ -z "${TMUX:-}" ]]; 
     exec tmux attach -t "$NAME"
   fi
   tmux new-session -d -s "$NAME" -c "$PWD" \
-    systemd-inhibit --what=idle:sleep:handle-lid-switch \
+    systemd-inhibit --what=sleep:handle-lid-switch \
       --who=afk --why="Claude Code работает автономно" \
       claude --name "$NAME" --remote-control "$NAME" \
              "${RESUME[@]}" \
@@ -91,7 +92,7 @@ if [[ "$TMUX_OK" == 1 ]] && command -v tmux >/dev/null && [[ -z "${TMUX:-}" ]]; 
 fi
 
 exec systemd-inhibit \
-  --what=idle:sleep:handle-lid-switch \
+  --what=sleep:handle-lid-switch \
   --who=afk --why="Claude Code работает автономно" \
   claude --name "$NAME" --remote-control "$NAME" \
          "${RESUME[@]}" \

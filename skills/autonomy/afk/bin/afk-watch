@@ -509,7 +509,7 @@ case "$ACTION" in
     systemd-run --user --unit "$UNIT" --collect \
       --description "Сторож ночной сессии Claude Code в $DIR" \
       "${ENV_ARGS[@]}" \
-      systemd-inhibit --what=idle:sleep:handle-lid-switch \
+      systemd-inhibit --what=sleep:handle-lid-switch \
         --who=afk-watch --why="ночная работа Claude Code" \
         "$SELF" --daemon --dir "$DIR" >/dev/null
     say "сторож приставлен к $DIR: ждёт .afk/heartbeat, поднимает работу после лимита и обрыва связи."
