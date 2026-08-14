@@ -119,6 +119,46 @@ except Exception:
 ' "$LIMITS" "$1" "$2"
 }
 
+# Оборвалась ли сессия: Claude Code записывает такие срывы в журнал сессии
+# отдельной пометкой (isApiErrorMessage). Печатает возраст обрыва в секундах,
+# если после него сессия так ничего и не сделала.
+session_broke() {
+  local sid="$1"
+  [[ -n "$sid" ]] || return 0
+  local file
+  file=$(find "$HOME/.claude/projects" -name "$sid.jsonl" -print -quit 2>/dev/null)
+  [[ -n "$file" ]] || return 0
+  python3 -c '
+import json, sys, time
+from datetime import datetime
+
+last_error = None
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if row.get("type") not in ("assistant", "user"):
+                continue
+            stamp = row.get("timestamp")
+            if row.get("isApiErrorMessage"):
+                last_error = stamp
+            else:
+                last_error = None
+except Exception:
+    sys.exit(0)
+
+if last_error:
+    broke = datetime.fromisoformat(last_error.replace("Z", "+00:00")).timestamp()
+    print(int(time.time() - broke))
+' "$file" 2>/dev/null || true
+}
+
 # Связь есть, если api.anthropic.com отвечает хоть чем-нибудь (адрес переопределяется
 # через AFK_PING_URL — так проверяется поведение при обрыве).
 online() { curl -s -o /dev/null -m 8 "${AFK_PING_URL:-https://api.anthropic.com/}" 2>/dev/null; }
@@ -252,15 +292,39 @@ tick() {
 
   # Heartbeat может и не появиться — тогда отсчёт идёт от последнего события
   # самого сторожа: заступил или поднимал работу.
-  hb=$(age_of "$AFKDIR/heartbeat")
-  if (( hb == 999999 )); then
-    local since="$watch_start"
-    (( $(state_num last_resume) > since )) && since="$(state_num last_resume)"
-    # Сторожа запускают в живой сессии; если отсчитывать не от чего, считаем,
-    # что молчание только что превысило порог.
-    (( since == 0 )) && since=$(( $(now) - IDLE_MIN * 60 - 60 ))
-    hb=$(( $(now) - since ))
+  # Явный обрыв виднее молчания: клиенту дают пять минут на свои повторы,
+  # дальше сессия уже точно никуда не поедет.
+  local broke
+  broke="$(session_broke "$(state_get resume_sid)")"
+  if [[ "$broke" =~ ^[0-9]+$ ]] && (( broke > 300 )); then
+    if online; then
+      log "сессия оборвалась $(( broke / 60 )) мин назад (обрыв связи в журнале сессии) — поднимаю"
+      close_stalled
+      start_session "$(state_get resume_sid)" "оборвалась связь" || true
+      return 0
+    fi
+    log "сессия оборвалась, но связи всё ещё нет — жду"
+    SLEEP=120
+    return 0
   fi
+
+  # Пульса нет с тех пор, как сторож заступил, — значит в каталоге обычная рабочая
+  # сессия, а не ночная. Тогда молчание ничего не значит (человек читает, думает,
+  # вышел за кофе), и остаются два надёжных признака: явный обрыв выше и пропажа
+  # сессии из списка.
+  local hb_at
+  hb_at=$(stat -c %Y "$AFKDIR/heartbeat" 2>/dev/null || echo 0)
+  if (( hb_at <= watch_start )); then
+    if [[ -z "$(sessions)" ]]; then
+      log "сессии в каталоге не осталось — поднимаю работу"
+      start_session "$(state_get resume_sid)" "сессия исчезла" || true
+      return 0
+    fi
+    say "ночного пульса нет — слежу только за обрывами"
+    return 0
+  fi
+
+  hb=$(age_of "$AFKDIR/heartbeat")
 
   if (( hb < IDLE_MIN * 60 )); then
     say "работа идёт, последний виток $(( hb / 60 )) мин назад"
@@ -389,6 +453,8 @@ case "$ACTION" in
     fi
     hb=$(age_of "$AFKDIR/heartbeat")
     if (( hb == 999999 )); then say "heartbeat не появлялся"; else say "последний виток $(( hb / 60 )) мин назад"; fi
+    broke="$(session_broke "$(state_get resume_sid)")"
+    [[ "$broke" =~ ^[0-9]+$ ]] && say "сессия оборвана $(( broke / 60 )) мин назад и с тех пор молчит"
     resumes="$(state_num resumes)"
     (( resumes > 0 )) && say "работа поднималась заново $resumes раз"
     [[ -f "$LOGFILE" ]] && { say ""; tail -5 "$LOGFILE"; }
