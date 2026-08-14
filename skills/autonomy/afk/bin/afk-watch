@@ -53,7 +53,8 @@ AFKDIR="$DIR/.afk"
 STATE="$AFKDIR/watch.state"
 LOGFILE="$AFKDIR/watch.log"
 
-SLUG="$(basename "$DIR" | tr -c 'A-Za-z0-9_-' '-')-$(printf '%s' "$DIR" | sha1sum | cut -c1-8)"
+# printf, а не echo: иначе перевод строки превращается в лишний дефис в имени юнита.
+SLUG="$(printf '%s' "$(basename "$DIR")" | tr -c 'A-Za-z0-9_-' '-')-$(printf '%s' "$DIR" | sha1sum | cut -c1-8)"
 UNIT="afk-watch-$SLUG"
 
 # ── мелочи ────────────────────────────────────────────────────────────────────
@@ -427,6 +428,16 @@ tick() {
   local why="сессия молчит $(( hb / 60 )) мин"
   [[ -n "$(state_get hit_limit)" ]] && why="лимит открылся"
 
+  # Сначала мягко: живой сессии в tmux достаточно написать. Закрываем только
+  # если писать некуда или это уже не помогло.
+  local nudged
+  nudged="$(state_num nudged)"
+  if (( $(now) - nudged > 900 )) && nudge_session; then
+    state_set hit_limit ""
+    SLEEP=300
+    return 0
+  fi
+
   close_stalled
   start_session "$(state_get resume_sid)" "$why" || true
   state_set hit_limit ""
@@ -457,14 +468,24 @@ case "$ACTION" in
       mkdir -p "$DIR/.git/info" && echo '.afk/' >> "$DIR/.git/info/exclude"
     fi
 
+    # Текст, которым сторож будит и поднимает работу, задают снаружи: сессия
+    # может жить не в каталоге проекта, и тогда «прочитай PLAN.md» ей ничего не даёт.
+    ENV_ARGS=(
+      --setenv="AFK_IDLE_MIN=$IDLE_MIN"
+      --setenv="AFK_WEEKLY_FLOOR=$WEEKLY_FLOOR"
+      --setenv="AFK_MAX_RESUMES=$MAX_RESUMES"
+      --setenv="AFK_CHECK_SEC=$CHECK_SEC"
+      --setenv="AFK_PERMISSION_MODE=$MODE"
+      --setenv="PATH=$PATH"
+    )
+    [[ -n "${AFK_RESUME_PROMPT:-}" ]] && ENV_ARGS+=(--setenv="AFK_RESUME_PROMPT=$AFK_RESUME_PROMPT")
+    [[ -n "${AFK_NUDGE_TEXT:-}" ]]    && ENV_ARGS+=(--setenv="AFK_NUDGE_TEXT=$AFK_NUDGE_TEXT")
+    [[ -n "${AFK_POLICY:-}" ]]        && ENV_ARGS+=(--setenv="AFK_POLICY=$AFK_POLICY")
+    [[ -n "${AFK_PING_URL:-}" ]]      && ENV_ARGS+=(--setenv="AFK_PING_URL=$AFK_PING_URL")
+
     systemd-run --user --unit "$UNIT" --collect \
       --description "Сторож ночной сессии Claude Code в $DIR" \
-      --setenv="AFK_IDLE_MIN=$IDLE_MIN" \
-      --setenv="AFK_WEEKLY_FLOOR=$WEEKLY_FLOOR" \
-      --setenv="AFK_MAX_RESUMES=$MAX_RESUMES" \
-      --setenv="AFK_CHECK_SEC=$CHECK_SEC" \
-      --setenv="AFK_PERMISSION_MODE=$MODE" \
-      --setenv="PATH=$PATH" \
+      "${ENV_ARGS[@]}" \
       systemd-inhibit --what=idle:sleep:handle-lid-switch \
         --who=afk-watch --why="ночная работа Claude Code" \
         "$SELF" --daemon --dir "$DIR" >/dev/null
