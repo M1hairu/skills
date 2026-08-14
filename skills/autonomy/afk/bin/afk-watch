@@ -346,6 +346,9 @@ case "$ACTION" in
     fi
     mkdir -p "$AFKDIR"
     rm -f "$AFKDIR/stop"
+    # Отсчёт молчания начинается сейчас: heartbeat мог остаться с прошлой ночи,
+    # и без этого сторож с ходу решит, что живая сессия давно встала.
+    touch "$AFKDIR/heartbeat"
     state_set started "$(now)"
     state_set resumes 0
     state_set last_resume 0
