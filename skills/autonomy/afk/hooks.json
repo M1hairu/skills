@@ -1,0 +1,10 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "*",
+      "hooks": [
+        { "type": "command", "command": "afk-autonomy --hook", "timeout": 10 }
+      ]
+    }
+  ]
+}

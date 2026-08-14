@@ -22,6 +22,7 @@
 #   skills/<категория>/<имя>/SKILL.md   → каталог линкуется в <область>/skills/<имя>
 #   skills/<категория>/<имя>/bin/*      → команды, по одной в ~/.local/bin/
 #   skills/<категория>/<имя>/claude/*   → файлы окружения Claude, в ~/.claude/
+#   skills/<категория>/<имя>/permissions.json, hooks.json → в ~/.claude/settings.json
 #
 # Область — либо ~/.claude (глобально), либо <проект>/.claude (--local). Команды и файлы
 # окружения ставятся глобально в любом случае: $PATH один на систему, и скрипты скиллов
@@ -180,6 +181,24 @@ unlink_if_ours() {
   ok "снят $rel"; removed=$((removed + 1))
 }
 
+# ── разрешения скилла ──
+# Правила из permissions.json уезжают в ~/.claude/settings.json: команды скилла
+# должны проходить без подтверждения, иначе автономный режим упрётся в вопрос
+# ровно тогда, когда спрашивать уже некого.
+settings_rules() {
+  local dir="$1" mode="$2" settings="$HOME/.claude/settings.json" kind file changed
+  for kind in permissions hooks; do
+    file="$dir/$kind.json"
+    [[ -f "$file" ]] || continue
+    if (( DRY )); then
+      ok "$(short "$settings") — $kind скилла"; continue
+    fi
+    changed=$(python3 "$REPO/scripts/settings-merge.py" "$kind" "$file" "$settings" "$mode")
+    [[ -n "$changed" ]] && ok "$(short "$settings") — $kind скилла"
+  done
+  return 0
+}
+
 install_skill() {
   local rel="$1" dir="$SKILLS_DIR/$1" name="${1##*/}" f d
   say "$rel"
@@ -200,6 +219,8 @@ install_skill() {
       link "$f" "$DEST_CLAUDE/$(basename "$f")"
     done
   fi
+
+  settings_rules "$dir" add
 }
 
 uninstall_skill() {
@@ -225,6 +246,8 @@ uninstall_skill() {
       [[ -e "$f" ]] && unlink_if_ours "$DEST_CLAUDE/$(basename "$f")"
     done
   fi
+
+  settings_rules "$dir" remove
   return 0
 }
 
