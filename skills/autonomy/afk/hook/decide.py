@@ -15,10 +15,16 @@ import re
 import shlex
 import sys
 
-# Файлы и каталоги, в которые ночью не ходят.
+# Файлы и каталоги, в которые ночью не ходят. Перед именем требуется граница пути:
+# иначе `process.env` читается как файл с секретами, а `docs.aws.amazon.com` — как
+# каталог с ключами, и обычная работа встаёт на ровном месте.
+EDGE = r"(?<![\w.-])"
 SECRETS = (
-    r"\.ssh\b", r"\.gnupg\b", r"\.aws\b", r"\.netrc\b", r"\.git-credentials\b",
-    r"\.credentials\.json\b", r"id_(rsa|ed25519|ecdsa)\b", r"\.env(\b|$)",
+    EDGE + r"\.ssh\b", EDGE + r"\.gnupg\b", EDGE + r"\.aws\b", EDGE + r"\.netrc\b",
+    EDGE + r"\.git-credentials\b", EDGE + r"\.credentials\.json\b",
+    # Имя ключа считается обращением к нему только в составе пути: в тексте
+    # (тест, документация, сообщение коммита) это просто слово.
+    r"(?<=/)id_(rsa|ed25519|ecdsa)\b", EDGE + r"\.env(\b|$)",
 )
 
 # Обёртки, за которыми прячется настоящая команда.
@@ -81,12 +87,22 @@ def split_commands(command):
         # Незакрытая кавычка: разбираем грубо, но лучше так, чем никак.
         tokens = strip_heredocs(command).split()
 
-    commands, current = [], []
+    commands, current, skip_next = [], [], False
     for token in tokens:
+        if skip_next:
+            skip_next = False
+            continue
         if token in (";", "&&", "||", "|", "&", "\n", "|&"):
             if current:
                 commands.append(current)
             current = []
+            continue
+        # Редирект и его цель — не аргументы команды: иначе `rm -rf build > /dev/null`
+        # читается как попытка удалить /dev/null.
+        if re.match(r"^\d*(>>?|<|&>|>&)$", token):
+            skip_next = True
+            continue
+        if re.match(r"^\d*(>>?|&>)\S", token):
             continue
         current.append(token.strip("(){}"))
     if current:
@@ -138,7 +154,11 @@ def check_bash(command, cwd, home):
     `here` меняется вслед за `cd` и нужен только чтобы понять, куда указывает
     относительный путь: `cd /etc && rm -rf apache2` метит вовсе не в проект.
     """
-    scratch = ("/tmp", "/var/tmp", os.path.join(home, ".cache"))
+    # Кэши сборщиков — расходный материал: ночная сборка должна уметь их снести,
+    # иначе упавший кэш чинить некому.
+    scratch = ["/tmp", "/var/tmp"] + [os.path.join(home, name) for name in (
+        ".cache", ".npm", ".yarn", ".gradle", ".m2", ".cargo", ".pub-cache", ".ivy2",
+        ".gem", ".nuget", ".bun", ".deno", ".pnpm-store")]
     project = cwd
     here = cwd
 
@@ -176,17 +196,29 @@ def check_bash(command, cwd, home):
                 if not candidate or candidate.startswith(("http", "-")):
                     continue
                 target = resolve(candidate, here)
-                if os.path.sep in candidate and not inside(target, project):
+                if (os.path.sep in candidate and not inside(target, project)
+                        and not any(inside(target, s) for s in scratch)):
                     return "deny", f"отправка наружу файла вне проекта ({target})"
 
         if name == "git":
-            flat = " ".join(args)
-            if re.search(r"\bpush\b", flat):
-                forced = re.search(r"(^|\s)(--force|-f)(\s|$)", flat) and "--force-with-lease" not in flat
-                # `+ветка` в refspec — тот же форс, только без слова.
-                if forced or re.search(r"(^|\s)\+\S+", flat) or "--delete" in args:
+            # Подкоманда — первый аргумент, который не флаг и не его значение:
+            # искать «push» по всей строке нельзя, слово попадается в сообщениях коммитов.
+            rest, subcommand = list(args), ""
+            while rest:
+                head = rest.pop(0)
+                if head in ("-C", "-c", "--git-dir", "--work-tree"):
+                    rest and rest.pop(0)
+                    continue
+                if head.startswith("-"):
+                    continue
+                subcommand = head
+                break
+
+            if subcommand == "push":
+                forced = any(a in ("--force", "-f") for a in rest)
+                if forced or any(a.startswith("+") for a in rest) or "--delete" in rest:
                     return "deny", "форс-пуш или снос ветки"
-            if "clean" in args and any(a.startswith("-") and "x" in a and "f" in a for a in args):
+            if subcommand == "clean" and any(a.startswith("-") and "x" in a and "f" in a for a in rest):
                 return "deny", "git clean -xf сносит незакоммиченное"
 
         recursive = any(a in ("-r", "-R", "--recursive") or
@@ -206,7 +238,7 @@ def check_bash(command, cwd, home):
                 if not inside(target, project):
                     return "deny", f"рекурсивное удаление вне проекта ({target})"
 
-        if name == "find" and ("-delete" in args or ("-exec" in args and "rm" in " ".join(args))):
+        if name == "find" and ("-delete" in args or ("-exec" in args and "rm" in args)):
             root = deletion_targets([a for a in args if not a.startswith("-")][:1], here)
             if root and not inside(root[0], project) and not any(inside(root[0], s) for s in scratch):
                 return "deny", f"массовое удаление вне проекта ({root[0]})"
@@ -242,7 +274,19 @@ def main() -> int:
     # где такой путь просто упомянут. У инструментов MCP имена полей заранее
     # неизвестны, поэтому там приходится смотреть на всё подряд.
     if tool.startswith("mcp__"):
-        paths = json.dumps(data, ensure_ascii=False)
+        # Из всего ввода берём только то, что похоже на путь: адреса и куски кода
+        # («process.env», «docs.aws.amazon.com») путями не являются.
+        def path_like(value):
+            if isinstance(value, dict):
+                return " ".join(path_like(v) for v in value.values())
+            if isinstance(value, list):
+                return " ".join(path_like(v) for v in value)
+            text = str(value)
+            if re.match(r"^[a-z][a-z0-9+.-]*://", text):
+                return ""
+            return " ".join(w for w in text.split() if w.startswith(("/", "~", ".")) or "/" in w)
+
+        paths = path_like(data)
     else:
         paths = " ".join(str(data.get(key, "")) for key in
                          ("file_path", "notebook_path", "path", "command"))
