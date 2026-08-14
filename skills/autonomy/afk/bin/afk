@@ -8,6 +8,7 @@
 #   afk --yolo "..."          — без ограничений разрешений (только для git-репо, который не жалко)
 #   afk --cloud "..."         — сеанс на стороне Anthropic, ноутбук можно выключить
 #   afk --no-watch "..."      — без сторожа, который поднимает работу после лимита и обрыва связи
+#   afk --no-tmux "..."       — не держать окно в tmux (тогда оборванную сессию не разбудить)
 #
 # Ноутбук не уснёт и не среагирует на закрытие крышки, пока сеанс жив.
 
@@ -17,6 +18,7 @@ POLICY="$HOME/.claude/afk-policy.md"
 MODE="dontAsk"
 CLOUD=0
 WATCH=1
+TMUX_OK=1
 RESUME=()
 
 while [[ $# -gt 0 ]]; do
@@ -24,6 +26,7 @@ while [[ $# -gt 0 ]]; do
     --yolo)  MODE="bypassPermissions"; shift ;;
     --cloud) CLOUD=1; shift ;;
     --no-watch) WATCH=0; shift ;;
+    --no-tmux)  TMUX_OK=0; shift ;;
     -c|--continue) RESUME=(--continue); shift ;;
     -r|--resume)
       shift
@@ -68,6 +71,24 @@ if [[ "$WATCH" == 1 ]] && command -v afk-watch >/dev/null; then
 fi
 
 NAME="afk-$(basename "$PWD")"
+
+# Окно держит tmux — тогда сторож сможет написать в оборванную сессию вместо того,
+# чтобы закрывать её и поднимать заново. Для человека ничего не меняется: tmux сразу
+# отдаёт то же самое окно, а закрытый терминал сессию больше не убивает.
+if [[ "$TMUX_OK" == 1 ]] && command -v tmux >/dev/null && [[ -z "${TMUX:-}" ]]; then
+  if tmux has-session -t "$NAME" 2>/dev/null; then
+    exec tmux attach -t "$NAME"
+  fi
+  tmux new-session -d -s "$NAME" -c "$PWD" \
+    systemd-inhibit --what=idle:sleep:handle-lid-switch \
+      --who=afk --why="Claude Code работает автономно" \
+      claude --remote-control "$NAME" \
+             "${RESUME[@]}" \
+             --permission-mode "$MODE" \
+             --append-system-prompt-file "$POLICY" \
+             ${PROMPT:+"$PROMPT"}
+  exec tmux attach -t "$NAME"
+fi
 
 exec systemd-inhibit \
   --what=idle:sleep:handle-lid-switch \

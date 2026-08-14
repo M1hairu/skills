@@ -169,6 +169,31 @@ journal() {
   printf '\n- %s — сторож: %s\n' "$(date '+%H:%M')" "$1" >> "$file"
 }
 
+# ── пробуждение вставшей сессии ───────────────────────────────────────────────
+
+# Оборванная сессия жива и ждёт ввода — ей достаточно что-нибудь написать.
+# Сделать это можно, только если окно держит tmux: изнутри Claude Code писать
+# в чужую сессию нельзя, а межсессионное сообщение ждёт подтверждения человека.
+NUDGE_TEXT="${AFK_NUDGE_TEXT:-Связь оборвалась, работа встала. Продолжай по PLAN.md с того места, где остановился, и трогай .afk/heartbeat каждый виток.}"
+
+nudge_session() {
+  command -v tmux >/dev/null || return 1
+  local target="afk-$(basename "$DIR")"
+  tmux has-session -t "$target" 2>/dev/null || return 1
+  if [[ "$DRY" == 1 ]]; then
+    log "написал бы во вставшее окно tmux «$target»"
+    return 0
+  fi
+  # Esc снимает подвисший ввод, дальше обычная строка и перевод строки.
+  tmux send-keys -t "$target" Escape 2>/dev/null || true
+  tmux send-keys -t "$target" "$NUDGE_TEXT" 2>/dev/null || return 1
+  tmux send-keys -t "$target" Enter 2>/dev/null || return 1
+  state_set nudged "$(now)"
+  log "написал во вставшее окно tmux «$target» — работа продолжится там же"
+  journal "сессия разбужена в своём окне после обрыва"
+  return 0
+}
+
 # ── подъём работы ─────────────────────────────────────────────────────────────
 
 # Фоновая сессия переживает закрытый терминал, а утром `claude attach <id>`
@@ -298,6 +323,14 @@ tick() {
   broke="$(session_broke "$(state_get resume_sid)")"
   if [[ "$broke" =~ ^[0-9]+$ ]] && (( broke > 300 )); then
     if online; then
+      # Разбудить в своём окне лучше, чем закрыть и поднять заново: остаются
+      # и контекст, и окно, и Remote Control. Пробуем раз в четверть часа.
+      local nudged
+      nudged="$(state_num nudged)"
+      if (( $(now) - nudged > 900 )) && nudge_session; then
+        SLEEP=300
+        return 0
+      fi
       log "сессия оборвалась $(( broke / 60 )) мин назад (обрыв связи в журнале сессии) — поднимаю"
       close_stalled
       start_session "$(state_get resume_sid)" "оборвалась связь" || true
