@@ -10,8 +10,9 @@
 # Живая сессия каждый виток трогает `.afk/heartbeat` (так велит afk-policy.md).
 # Если файл не обновлялся дольше AFK_IDLE_MIN минут, сторож разбирается, почему:
 # нет связи или выбрано пятичасовое окно — ждёт, иначе поднимает работу заново
-# фоновой сессией с прежним контекстом. Недельный кап он не проедает: выше
-# AFK_WEEKLY_FLOOR процентов работа не возобновляется, остаток остаётся человеку.
+# с прежним контекстом — в окне tmux «afk-<каталог>», а если tmux недоступен,
+# фоновой сессией. Недельный кап он не проедает: выше AFK_WEEKLY_FLOOR процентов
+# работа не возобновляется, остаток остаётся человеку.
 
 set -euo pipefail
 
@@ -192,10 +193,22 @@ journal() {
 # в чужую сессию нельзя, а межсессионное сообщение ждёт подтверждения человека.
 NUDGE_TEXT="${AFK_NUDGE_TEXT:-Связь оборвалась, работа встала. Продолжай по PLAN.md с того места, где остановился, и трогай .afk/heartbeat каждый виток.}"
 
+TARGET="afk-$(basename "$DIR")"
+
+# Живёт ли в окне Claude Code. Смотрим не на процесс панели — tmux запускает
+# команду через оболочку, и `pane_current_command` показывает её, а не сессию, —
+# а на список сессий: у ночной сессии имя совпадает с именем окна.
+window_session() {
+  sessions | awk -F'|' -v n="$TARGET" '$1=="interactive" && $6==n {print $3; exit}'
+}
+
 nudge_session() {
   command -v tmux >/dev/null || return 1
-  local target="afk-$(basename "$DIR")"
+  local target="$TARGET"
   tmux has-session -t "$target" 2>/dev/null || return 1
+  # В окне может остаться одна оболочка — тогда текст ушёл бы в командную строку,
+  # а работа так и стояла бы. Такое окно не будят, а поднимают заново.
+  [[ -n "$(window_session)" ]] || return 1
   if [[ "$DRY" == 1 ]]; then
     log "написал бы во вставшее окно tmux «$target»"
     return 0
@@ -212,19 +225,101 @@ nudge_session() {
 
 # ── подъём работы ─────────────────────────────────────────────────────────────
 
-# Фоновая сессия переживает закрытый терминал, а утром `claude attach <id>`
-# возвращает её человеку в окно.
+# Как поднимать работу: сначала в окне tmux, и только если не вышло — фоновой
+# сессией. Окно лучше во всём: утром `tmux attach` показывает работу как есть,
+# а следующий обрыв лечится пинком, без закрытия и потери контекста. Фоновая
+# сессия остаётся запасным путём — она есть всегда, но окна после себя не
+# оставляет, и человек утром видит мёртвый терминал.
+
+# Аргументы Claude Code одной строкой для tmux: он склеивает всё, что ему передали,
+# и отдаёт `sh -c`, поэтому кавычки расставляем сами.
+tmux_command() {
+  local sid="$1" cmd=()
+  cmd=(systemd-inhibit --what=sleep:handle-lid-switch
+       --who=afk-watch --why="ночная работа Claude Code"
+       claude --name "$TARGET" --remote-control "$TARGET" --permission-mode "$MODE")
+  [[ -f "$POLICY" ]] && cmd+=(--append-system-prompt-file "$POLICY")
+  [[ -n "$sid" ]] && cmd+=(--resume "$sid")
+  cmd+=("$RESUME_PROMPT")
+  # Хвостом — оболочка: панель tmux закрывается вместе с командой, а окно должно
+  # пережить и конец сессии, иначе человек снова застанет пустоту вместо работы.
+  printf '%q ' "${cmd[@]}"
+  printf '; exec "${SHELL:-/bin/sh}"'
+}
+
+start_in_tmux() {
+  local sid="$1" line sid_new
+  command -v tmux >/dev/null || return 1
+  line="$(tmux_command "$sid")"
+
+  if [[ "$DRY" == 1 ]]; then
+    if tmux has-session -t "$TARGET" 2>/dev/null; then
+      log "перезапустил бы работу в окне tmux «$TARGET»"
+    else
+      log "поднял бы работу в новом окне tmux «$TARGET»"
+    fi
+    return 0
+  fi
+
+  if tmux has-session -t "$TARGET" 2>/dev/null; then
+    # Окно живо, но Claude Code в нём закончился — поднимаем прямо в этой панели,
+    # чтобы у человека не плодились окна.
+    tmux respawn-pane -k -t "$TARGET" "$line" 2>/dev/null || return 1
+  else
+    # Сервер tmux заводим отдельным scope: запущенный из юнита сторожа, он попал бы
+    # в его cgroup и умер бы вместе с ним — вместе со всей ночной работой.
+    systemd-run --user --scope --quiet -- \
+      tmux new-session -d -s "$TARGET" -n afk -c "$DIR" "$line" 2>/dev/null \
+      || tmux new-session -d -s "$TARGET" -n afk -c "$DIR" "$line" 2>/dev/null \
+      || return 1
+  fi
+
+  sleep 15
+  sid_new="$(window_session)"
+
+  # Единственный вопрос при старте — доверие к каталогу, и первым в нём выбран
+  # ответ «да, доверяю». Enter подтверждает именно его (Escape закрыл бы сессию),
+  # а если окно уже с оболочкой — просто добавит пустую строку. Каталог, где ночь
+  # шла, человек и так доверял: ответ не сохраняется между запусками.
+  if [[ -z "$sid_new" ]]; then
+    tmux send-keys -t "$TARGET" Enter 2>/dev/null || true
+    sleep 15
+    sid_new="$(window_session)"
+  fi
+
+  if [[ -z "$sid_new" ]]; then
+    # Окно есть, а сессии в нём нет: чаще всего каталог не отмечен доверенным,
+    # и Claude Code ждёт ответа на вопрос, которого ночью никто не даст.
+    log "в окне tmux «$TARGET» сессия не завелась — поднимаю фоновую"
+    tmux kill-session -t "$TARGET" 2>/dev/null || true
+    return 1
+  fi
+
+  state_set resume_sid "$sid_new"
+  state_set nudged 0
+  return 0
+}
+
 start_session() {
   local sid="$1" why="$2" args=() out id verdict
 
   if [[ "$DRY" == 1 ]]; then
     log "поднял бы работу заново ($why), контекст ${sid:-с чистого листа}"
+    start_in_tmux "$sid" || true
     return 0
   fi
 
   # Без автономности поднятая сессия немая: в dontAsk любая команда, требующая
   # разрешения, молча отклоняется, и работа не двигается.
   command -v afk-autonomy >/dev/null && afk-autonomy --on --dir "$DIR" >/dev/null 2>&1 || true
+
+  if start_in_tmux "$sid"; then
+    state_set resumes "$(( $(state_num resumes) + 1 ))"
+    state_set last_resume "$(now)"
+    log "работа поднята в окне tmux «$TARGET» ($why) — утром «tmux attach -t $TARGET»"
+    journal "работа поднята заново ($why) в окне tmux «$TARGET»"
+    return 0
+  fi
 
   args=(--bg --permission-mode "$MODE")
   [[ -f "$POLICY" ]] && args+=(--append-system-prompt-file "$POLICY")

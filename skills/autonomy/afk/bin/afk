@@ -80,14 +80,17 @@ if [[ "$TMUX_OK" == 1 ]] && command -v tmux >/dev/null && [[ -z "${TMUX:-}" ]]; 
   if tmux has-session -t "$NAME" 2>/dev/null; then
     exec tmux attach -t "$NAME"
   fi
-  tmux new-session -d -s "$NAME" -c "$PWD" \
+  # Окно переживает конец сессии: панель закрылась бы вместе с командой, а сторожу
+  # нужно куда-то поднимать работу — и человеку утром есть куда смотреть.
+  LINE="$(printf '%q ' \
     systemd-inhibit --what=sleep:handle-lid-switch \
       --who=afk --why="Claude Code работает автономно" \
       claude --name "$NAME" --remote-control "$NAME" \
              "${RESUME[@]}" \
              --permission-mode "$MODE" \
              --append-system-prompt-file "$POLICY" \
-             ${PROMPT:+"$PROMPT"}
+             ${PROMPT:+"$PROMPT"})"
+  tmux new-session -d -s "$NAME" -c "$PWD" "$LINE; exec \"\${SHELL:-/bin/sh}\""
   exec tmux attach -t "$NAME"
 fi
 
