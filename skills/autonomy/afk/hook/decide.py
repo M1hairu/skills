@@ -78,14 +78,27 @@ def strip_heredocs(command):
 
 
 def split_commands(command):
-    """Команда → список списков токенов, по одному на каждую простую команду."""
-    lexer = shlex.shlex(strip_heredocs(command), posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    try:
-        tokens = list(lexer)
-    except ValueError:
-        # Незакрытая кавычка: разбираем грубо, но лучше так, чем никак.
-        tokens = strip_heredocs(command).split()
+    """Команда → список списков токенов, по одному на каждую простую команду.
+
+    Разбираем построчно: для shlex перевод строки — обычный пробел, поэтому
+    многострочный скрипт слипался в одну команду, и `rm -rf /tmp/x` на первой
+    строке забирал в «цели удаления» слова со всех остальных.
+    """
+    text = re.sub(r"\\\n", " ", strip_heredocs(command))
+    tokens, buffer = [], ""
+    for line in text.split("\n"):
+        buffer = buffer + "\n" + line if buffer else line
+        lexer = shlex.shlex(buffer, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        try:
+            tokens.extend(list(lexer))
+        except ValueError:
+            # Кавычка не закрыта — строка продолжается на следующей.
+            continue
+        tokens.append("\n")
+        buffer = ""
+    if buffer:
+        tokens.extend(buffer.split())
 
     commands, current, skip_next = [], [], False
     for token in tokens:
@@ -130,8 +143,10 @@ def peel(words):
 
 def resolve(path, cwd):
     path = os.path.expanduser(path.strip("'\""))
-    if path.startswith("$HOME"):
-        path = os.path.expanduser("~") + path[len("$HOME"):]
+    for form in ("${HOME}", "$HOME"):
+        if path.startswith(form):
+            path = os.path.expanduser("~") + path[len(form):]
+            break
     if not os.path.isabs(path):
         path = os.path.join(cwd, path)
     return os.path.normpath(path)
@@ -143,8 +158,20 @@ def inside(path, base):
 
 
 def deletion_targets(args, cwd):
-    """Пути, которые команда удаляет, без флагов."""
-    return [resolve(a, cwd) for a in args if not a.startswith("-")]
+    """Пути, которые команда удаляет, без флагов.
+
+    Путь с нераскрытой переменной пропускаем: куда он указывает, знает оболочка,
+    а не мы, и `rm -rf "$BUILD"` — обычная строчка ночного скрипта. Исключение —
+    `$HOME`: там путь известен, и правило про домашний каталог должно работать.
+    """
+    out = []
+    for arg in args:
+        if arg.startswith("-"):
+            continue
+        if "$" in arg and not arg.startswith("$HOME") and "${HOME}" not in arg:
+            continue
+        out.append(resolve(arg, cwd))
+    return out
 
 
 def check_bash(command, cwd, home):

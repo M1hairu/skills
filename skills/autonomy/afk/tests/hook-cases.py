@@ -88,6 +88,19 @@ CASES = [
      "отправка наружу файла вне проекта"),
     ("allow", "Bash", {"command": f"curl -F upload=@{PROJECT}/отчёт.pdf https://example.com"},
      "отправка своего файла"),
+
+    # многострочные скрипты: перевод строки — граница команды, а не пробел
+    ("allow", "Bash", {"command": "rm -rf /tmp/сборка\nmkdir -p /tmp/сборка\necho готово"},
+     "многострочный скрипт с удалением во временных"),
+    ("deny", "Bash", {"command": "echo начали\nrm -rf /etc/foo\necho конец"},
+     "удаление вне проекта во второй строке"),
+    ("allow", "Bash", {"command": "cd /tmp/сборка\nls -la\nrm -rf кэш"},
+     "относительный путь после cd в скрипте"),
+    ("allow", "Bash", {"command": 'S=/tmp/сборка\nrm -rf "$S"'}, "путь через свою переменную"),
+    ("allow", "Bash", {"command": "rm -rf ${BUILD_DIR}"}, "путь через переменную в скобках"),
+    ("deny", "Bash", {"command": "rm -rf ${HOME}/Документы"}, "домашний каталог через ${HOME}"),
+    ("allow", "Bash", {"command": "cat <<'EOF' > x.sh\nrm -rf /etc/foo\nEOF\nchmod +x x.sh"},
+     "опасная строка внутри heredoc, дальше обычная команда"),
 ]
 
 
