@@ -331,15 +331,24 @@ def secret_tokens(command):
 
 
 def secret_hit(tokens):
-    """Первое слово, которым трогают ключи или учётные данные."""
+    """Первое слово, которым трогают ключи или учётные данные.
+
+    Временные каталоги пропускаем: настоящих ключей там нет, а тестовые стенды
+    и распакованные архивы живут именно в них — иначе ночью не проверить
+    собственную установку.
+    """
     for raw in tokens:
         token = str(raw).strip("'\"")
+        if re.match(r"^(/tmp|/var/tmp)/", os.path.expanduser(token)):
+            continue
         for pattern in SECRETS:
             if re.search(pattern, token):
                 return token
-        # `.env` ловим по имени файла, а не по подстроке: `afk.env` и
-        # `prod.env` — те же секреты, а `process.env` в коде — не файл.
-        if ("/" in token or token.startswith(("~", "."))) and \
+        # `.env` ловим по имени файла, а не по подстроке: `afk.env` и `prod.env` —
+        # те же секреты, а `process.env` в коде — не файл. Только для путей, про
+        # которые видно, куда они ведут: у `$КАТАЛОГ/имя.env` это неизвестно,
+        # и отклонять его — гадание.
+        if os.path.expanduser(token).startswith("/") and \
                 os.path.basename(token).endswith(".env"):
             return token
     return None

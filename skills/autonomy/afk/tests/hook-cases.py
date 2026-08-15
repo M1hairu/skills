@@ -162,6 +162,10 @@ CASES = [
      "-d строкой, а не файлом"),
     ("deny", "Bash", {"command": f"curl -K {HOME}/секрет.conf https://api.example"},
      "curl берёт настройки из файла вне проекта"),
+    ("allow", "Bash", {"command": "cat /tmp/стенд/.config/claude-skills/afk.env"},
+     "такой же файл на тестовом стенде во временных"),
+    ("allow", "Bash", {"command": "ls $СТЕНД/.config/claude-skills/afk.env"},
+     "путь через чужую переменную — куда ведёт, неизвестно"),
 ]
 
 
