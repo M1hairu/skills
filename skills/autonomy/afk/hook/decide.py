@@ -93,30 +93,46 @@ def read_until(line, start, closer):
 
 
 def read_heredoc_mark(line, i):
-    """Ограничитель heredoc после `<<` и позиция за ним, либо (None, i)."""
+    """Ограничитель heredoc после `<<` и позиция за ним, либо (None, i).
+
+    Ограничитель бывает склеен из кусков — `<<E"OF"` для оболочки это `EOF`, —
+    поэтому читаем всё слово целиком, снимая кавычки по дороге.
+    """
     j = i + 2
+    # `<<<` — строка на вход, а не heredoc: тела у неё нет.
+    if j < len(line) and line[j] == "<":
+        return None, i
     if j < len(line) and line[j] == "-":
         j += 1
     while j < len(line) and line[j] in " \t":
         j += 1
     if j >= len(line):
         return None, i
-    if line[j] in "'\"":
-        quote = line[j]
-        end = line.find(quote, j + 1)
-        if end == -1:
-            return None, i
-        return line[j + 1:end], end + 1
-    if line[j] == "\\":
+
+    parts, quoted = [], False
+    while j < len(line) and line[j] not in " \t;&|<>()`":
+        if line[j] in "'\"":
+            quote = line[j]
+            end = line.find(quote, j + 1)
+            if end == -1:
+                return None, i
+            parts.append(line[j + 1:end])
+            quoted = True
+            j = end + 1
+            continue
+        if line[j] == "\\" and j + 1 < len(line):
+            parts.append(line[j + 1])
+            quoted = True
+            j += 2
+            continue
+        parts.append(line[j])
         j += 1
-    end = j
-    while end < len(line) and line[end] not in " \t;&|<>()\"'`":
-        end += 1
-    word = line[j:end]
+
+    word = "".join(parts)
     # `1 << 2`, `x << $n`, `<< -8` — это сдвиг, а не ограничитель.
-    if not word or word[0].isdigit() or word[0] in "$-":
+    if not word or (not quoted and (word[0].isdigit() or word[0] in "$-")):
         return None, i
-    return word, end
+    return word, j
 
 
 def preprocess(command):
@@ -131,14 +147,25 @@ def preprocess(command):
     """
     out_lines, nested, pending = [], [], []
     quote = None
+    carry = ""
 
     for raw in command.splitlines():
         # Пока не закрыт heredoc, строки — данные. Кавычка, открытая на прошлой
         # строке, означает, что строка продолжается: heredoc там начаться не мог.
+        # Обратный слэш в конце строки тела ничего не склеивает — раньше склейка
+        # шла до разбора, ограничитель прилипал к тексту, и остаток скрипта
+        # целиком считался телом heredoc.
         if pending and quote is None:
-            if raw.strip() == pending[0]:
+            mark = pending[0]
+            if raw == mark or raw.rstrip() == mark or raw.lstrip("\t") == mark:
                 pending.pop(0)
             continue
+
+        # Продолжение строки склеиваем здесь, а не заранее: до сюда доходят
+        # только настоящие команды, без тел heredoc.
+        if carry:
+            raw = carry + raw
+            carry = ""
 
         line, i, word_start = [], 0, True
         while i < len(raw):
@@ -154,6 +181,15 @@ def preprocess(command):
             if quote == '"':
                 if ch == "\\" and i + 1 < len(raw):
                     line.append(ch); line.append(raw[i + 1]); i += 2; continue
+                if raw.startswith("$((", i):
+                    end = raw.find("))", i)
+                    if end == -1:
+                        line.append(ch); i += 1; continue
+                    arith, deeper = preprocess(raw[i + 3:end])
+                    nested.extend(deeper)
+                    if "$(" in raw[i + 3:end] or "`" in raw[i + 3:end]:
+                        nested.append(arith)
+                    line.append(" "); i = end + 2; continue
                 if raw.startswith("$(", i):
                     chunk, i = read_until(raw, i + 2, ")")
                     nested.append(chunk); line.append(" "); continue
@@ -176,15 +212,31 @@ def preprocess(command):
                 line.append(ch); i += 1; word_start = False; continue
             if raw.startswith("$((", i):
                 end = raw.find("))", i)
-                line.append(" ")
-                i = len(raw) if end == -1 else end + 2
-                continue
+                if end == -1:
+                    # Скобки не закрыты — это не арифметика; съедать остаток
+                    # строки нельзя, там могут стоять настоящие команды.
+                    line.append(ch); i += 1; word_start = False; continue
+                # Внутри арифметики тоже бывает подстановка: `$(( $(команда) ))`.
+                arith, deeper = preprocess(raw[i + 3:end])
+                nested.extend(deeper)
+                if "$(" in raw[i + 3:end] or "`" in raw[i + 3:end]:
+                    nested.append(arith)
+                line.append(" "); i = end + 2; word_start = False; continue
             if raw.startswith("$(", i):
+                chunk, i = read_until(raw, i + 2, ")")
+                nested.append(chunk); line.append(" "); word_start = False; continue
+            # `<( … )` и `>( … )` — тоже команды, просто отданные как файл.
+            if raw.startswith("<(", i) or raw.startswith(">(", i):
                 chunk, i = read_until(raw, i + 2, ")")
                 nested.append(chunk); line.append(" "); word_start = False; continue
             if ch == "`":
                 chunk, i = read_until(raw, i + 1, "`")
                 nested.append(chunk); line.append(" "); word_start = False; continue
+            # `<<<` — строка на вход. Пропускаем целиком: иначе второй и третий
+            # `<` снова читаются как начало heredoc, и его «телом» становится
+            # весь остаток скрипта.
+            if raw.startswith("<<<", i):
+                line.append(" "); i += 3; word_start = True; continue
             if raw.startswith("<<", i):
                 mark, after = read_heredoc_mark(raw, i)
                 if mark is not None:
@@ -195,7 +247,18 @@ def preprocess(command):
             word_start = ch in " \t;&|()"
             i += 1
 
-        out_lines.append("".join(line))
+        text = "".join(line)
+        # Продолжение строки считаем по уже очищенному тексту: комментарий
+        # оболочка на следующую строку не продолжает, а склейка до разбора
+        # проглатывала следующую команду вместе с ним.
+        if quote is None and re.search(r"(?<!\\)(\\\\)*\\$", text):
+            carry = text[:-1]
+            continue
+
+        out_lines.append(text)
+
+    if carry:
+        out_lines.append(carry)
 
     deeper = []
     for chunk in list(nested):
@@ -212,7 +275,7 @@ def parse(command):
     многострочный скрипт слипался в одну команду, и `rm -rf /tmp/x` на первой
     строке забирал в «цели удаления» слова со всех остальных.
     """
-    text, nested = preprocess(re.sub(r"\\\n", " ", command))
+    text, nested = preprocess(command)
     if nested:
         # Команда внутри `$( … )` — такая же команда, просто написанная внутри
         # другой. Разбираем её отдельной строкой.
@@ -230,8 +293,13 @@ def parse(command):
         try:
             tokens.extend(list(lexer))
         except ValueError:
-            # Кавычка не закрыта — строка продолжается на следующей.
-            continue
+            # Кавычка не закрыта — строка продолжается на следующей. Копить
+            # буфер бесконечно нельзя: каждая строка перелексируется целиком,
+            # и на скрипте с одной незакрытой кавычкой разбор уходит в минуты,
+            # то есть хук не отвечает вовсе.
+            if buffer.count("\n") < 40:
+                continue
+            tokens.extend(buffer.split())
         tokens.append("\n")
         buffer = ""
     if buffer:

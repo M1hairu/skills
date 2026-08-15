@@ -186,6 +186,25 @@ CASES = [
     ("allow", "Bash", {"command": "echo привет # это комментарий"}, "комментарий в конце строки"),
     ("allow", "Bash", {"command": "cat <<EOF > s.sh\nrm -rf /etc\nEOF\nls"},
      "heredoc без кавычек: тело — данные"),
+
+    # где кончается heredoc и что ещё похоже на него
+    ("deny", "Bash", {"command": "cat <<'EOF' > /tmp/x\nтекст \\\nEOF\nrm -rf /etc"},
+     "слэш в конце тела не продолжает heredoc"),
+    ("deny", "Bash", {"command": 'cat <<E"OF" > /tmp/x\nтело\nEOF\nrm -rf /etc'},
+     "ограничитель склеен из кусков"),
+    ("deny", "Bash", {"command": "grep -q foo <<< bar\nrm -rf /etc"},
+     "here-string не открывает heredoc"),
+    ("allow", "Bash", {"command": "grep -q foo <<< 'текст'"}, "обычная here-string"),
+    ("deny", "Bash", {"command": "echo # заметка \\\nrm -rf /etc"},
+     "комментарий не продолжается на следующую строку"),
+    ("deny", "Bash", {"command": "echo $(($(rm -rf /etc; echo 1)))"},
+     "команда внутри арифметики"),
+    ("deny", "Bash", {"command": "echo $((1+2))#к; rm -rf /etc"},
+     "решётка сразу после арифметики"),
+    ("deny", "Bash", {"command": "diff <(rm -rf /etc) /tmp/файл"},
+     "команда в подстановке процесса"),
+    ("allow", "Bash", {"command": "diff <(ls /tmp) <(ls /var/tmp)"},
+     "обычная подстановка процесса"),
 ]
 
 
