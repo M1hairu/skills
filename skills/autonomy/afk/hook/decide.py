@@ -174,6 +174,24 @@ def deletion_targets(args, cwd):
     return out
 
 
+# Команды, которые ничего не читают и не отправляют: путь в их аргументах —
+# текст, а не обращение к файлу. Без этого ночью не написать ни теста, ни строки
+# документации, где такой путь просто упомянут.
+PRINTERS = {"echo", "printf", ":", "true", "false"}
+
+
+def secret_paths(command):
+    """Части команды, где путь к ключам означает обращение к ним."""
+    out = []
+    for words in split_commands(command):
+        name, args = peel(words)
+        if not name or name in PRINTERS:
+            continue
+        out.append(name)
+        out.extend(args)
+    return " ".join(out)
+
+
 def check_bash(command, cwd, home):
     """Вернуть (решение, причина) или None, если возражений нет.
 
@@ -214,16 +232,37 @@ def check_bash(command, cwd, home):
            (name == "security" and "find-generic-password" in args):
             return "deny", "выдача учётных данных"
 
-        # Отправка файла наружу: curl/wget с @файлом за пределами проекта.
+        # Отправка файла наружу: curl/wget, которым скормили файл за пределами
+        # проекта. Формы разные — `-d @файл`, `-T файл`, `--post-file=файл`, —
+        # и каждая пишется ночью не задумываясь.
         if name in ("curl", "wget"):
+            takes_file = {"-T", "--upload-file", "--post-file", "-d", "--data",
+                          "--data-binary", "--data-raw", "--data-ascii", "-F", "--form"}
+            candidates, expect_file = [], False
             for arg in args:
-                if "@" not in arg:
+                if expect_file:
+                    candidates.append(arg)
+                    expect_file = False
                     continue
-                candidate = arg.split("@", 1)[1]
+                if arg in takes_file:
+                    expect_file = True
+                    continue
+                if arg.startswith("--") and "=" in arg:
+                    flag, value = arg.split("=", 1)
+                    if flag in takes_file:
+                        candidates.append(value)
+                        continue
+                if "@" in arg:
+                    candidates.append(arg.split("@", 1)[1])
+
+            for candidate in candidates:
+                candidate = candidate.split("@", 1)[-1]
                 if not candidate or candidate.startswith(("http", "-")):
                     continue
+                if os.path.sep not in candidate:
+                    continue
                 target = resolve(candidate, here)
-                if (os.path.sep in candidate and not inside(target, project)
+                if (not inside(target, project)
                         and not any(inside(target, s) for s in scratch)):
                     return "deny", f"отправка наружу файла вне проекта ({target})"
 
@@ -316,7 +355,9 @@ def main() -> int:
         paths = path_like(data)
     else:
         paths = " ".join(str(data.get(key, "")) for key in
-                         ("file_path", "notebook_path", "path", "command"))
+                         ("file_path", "notebook_path", "path"))
+        if data.get("command"):
+            paths += " " + secret_paths(str(data["command"]))
     for pattern in SECRETS:
         if re.search(pattern, paths):
             emit("deny", "ключи и учётные данные ночью не трогаем — запиши в BLOCKED.md",
