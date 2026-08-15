@@ -166,6 +166,26 @@ CASES = [
      "такой же файл на тестовом стенде во временных"),
     ("allow", "Bash", {"command": "ls $СТЕНД/.config/claude-skills/afk.env"},
      "путь через чужую переменную — куда ведёт, неизвестно"),
+
+    # кавычки решают: что внутри них — текст, что снаружи — команда
+    ("allow", "Bash", {"command": "echo 'пример: $(sudo apt install x)'"},
+     "подстановка в одинарных кавычках — просто текст"),
+    ("allow", "Bash", {"command": "echo 'в тексте `sudo reboot` как пример'"},
+     "обратные кавычки в тексте"),
+    ("allow", "Bash", {"command": 'echo "\\$(rm -rf /etc)"'}, "экранированный доллар"),
+    ("deny", "Bash", {"command": "awk '{print $1 << 2}' файл && rm -rf /etc"},
+     "сдвиг в кавычках не съедает остаток строки"),
+    ("deny", "Bash", {"command": 'echo "a << b" && rm -rf /etc'},
+     "«<<» в кавычках не начинает heredoc"),
+    ("deny", "Bash", {"command": 'echo "a << b"\nrm -rf /etc\nls'},
+     "то же в многострочном скрипте"),
+    ("deny", "Bash", {"command": 'git commit -m "#123 правка" && rm -rf /etc'},
+     "решётка в кавычках не гасит строку"),
+    ("deny", "Bash", {"command": "echo '#!/bin/sh' > x.sh && rm -rf /etc"},
+     "шебанг в кавычках не гасит строку"),
+    ("allow", "Bash", {"command": "echo привет # это комментарий"}, "комментарий в конце строки"),
+    ("allow", "Bash", {"command": "cat <<EOF > s.sh\nrm -rf /etc\nEOF\nls"},
+     "heredoc без кавычек: тело — данные"),
 ]
 
 

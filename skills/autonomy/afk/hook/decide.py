@@ -61,95 +61,148 @@ def watched_dirs(dirs_file):
         return []
 
 
-# Оператор heredoc: `<<` или `<<-`, дальше ограничитель — слово в кавычках,
-# со слэшем или голое. Отличаем от сдвига влево в коде (`1 << n`): там дальше
-# идёт число или переменная, а не имя-ограничитель, и перед `<<` не бывает
-# пробела-с-именем... надёжнее смотреть на сам ограничитель.
-HEREDOC = re.compile(r"<<-?\s*(?:'(?P<q1>[^']+)'|\"(?P<q2>[^\"]+)\"|\\(?P<esc>\S+)|(?P<bare>[^\s;&|<>()\"'`]+))")
+def read_until(line, start, closer):
+    """Содержимое подстановки от `start` до парного `closer` и позиция за ним.
 
-
-def heredoc_marks(line):
-    """Ограничители heredoc, открытые в этой строке, и позиция первого из них."""
-    marks, start = [], None
-    for match in HEREDOC.finditer(line):
-        word = match.group("q1") or match.group("q2") or match.group("esc") or match.group("bare")
-        # `$((1 << n))`, `x=$((a<<2))`, `print(1 << shift)` — это сдвиг, не heredoc.
-        if re.fullmatch(r"[-+]?\d+\)*", word) or word.startswith(("$", "-")):
-            continue
-        marks.append(word)
-        if start is None:
-            start = match.start()
-    return marks, start
-
-
-def strip_heredocs(command):
-    """Тело heredoc — данные, а не команды: их разбирать нельзя.
-
-    В одной строке heredoc может быть несколько (`cmd <<A <<B`), тела идут
-    подряд, ограничитель бывает в кавычках, со слэшем и не из латиницы.
+    Считаем вложенные `$(` и уважаем кавычки внутри: `$(echo ")")` закрывается
+    не первой попавшейся скобкой.
     """
-    out, pending = [], []
-    for line in command.splitlines():
-        if pending:
-            if line.strip() == pending[0]:
+    depth, quote, i = 1, None, start
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(line):
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+        elif closer == ")" and line.startswith("$(", i):
+            depth += 1
+            i += 2
+            continue
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return line[start:i], i + 1
+        i += 1
+    return line[start:], len(line)
+
+
+def read_heredoc_mark(line, i):
+    """Ограничитель heredoc после `<<` и позиция за ним, либо (None, i)."""
+    j = i + 2
+    if j < len(line) and line[j] == "-":
+        j += 1
+    while j < len(line) and line[j] in " \t":
+        j += 1
+    if j >= len(line):
+        return None, i
+    if line[j] in "'\"":
+        quote = line[j]
+        end = line.find(quote, j + 1)
+        if end == -1:
+            return None, i
+        return line[j + 1:end], end + 1
+    if line[j] == "\\":
+        j += 1
+    end = j
+    while end < len(line) and line[end] not in " \t;&|<>()\"'`":
+        end += 1
+    word = line[j:end]
+    # `1 << 2`, `x << $n`, `<< -8` — это сдвиг, а не ограничитель.
+    if not word or word[0].isdigit() or word[0] in "$-":
+        return None, i
+    return word, end
+
+
+def preprocess(command):
+    """Один проход по команде: снять комментарии, тела heredoc и подстановки.
+
+    Всё это раньше делали три независимых прохода по сырой строке, и каждый
+    ошибался на кавычках: `echo 'пример $(sudo …)'` отклонялся, а `echo "a << b"
+    && rm -rf /etc` — наоборот, проходил целиком, потому что `<<` в кавычках
+    принимался за heredoc и остаток строки не проверялся вовсе.
+
+    Возвращает (текст для разбора, команды из подстановок).
+    """
+    out_lines, nested, pending = [], [], []
+    quote = None
+
+    for raw in command.splitlines():
+        # Пока не закрыт heredoc, строки — данные. Кавычка, открытая на прошлой
+        # строке, означает, что строка продолжается: heredoc там начаться не мог.
+        if pending and quote is None:
+            if raw.strip() == pending[0]:
                 pending.pop(0)
             continue
-        marks, start = heredoc_marks(line)
-        if marks:
-            pending = marks
-            line = line[:start]
-        out.append(line)
-    return "\n".join(out)
 
+        line, i, word_start = [], 0, True
+        while i < len(raw):
+            ch = raw[i]
 
-def pull_substitutions(text):
-    """Вырезать `$( … )` и обратные кавычки, вернув (остаток, вложенные команды).
+            if quote == "'":
+                if ch == "'":
+                    quote = None
+                line.append(ch)
+                i += 1
+                continue
 
-    Внутри подстановки стоит настоящая команда: `echo "$(cat ~/.ssh/id_rsa)"`
-    читает ключ, хотя снаружи виден безобидный `echo`. Разбирать её надо
-    отдельно, иначе безопасной выглядит любая обёртка.
-    """
-    out, inner, i = [], [], 0
-    while i < len(text):
-        # `$(( … ))` — арифметика, команд там нет.
-        if text.startswith("$((", i):
-            end = text.find("))", i)
-            if end == -1:
-                out.append(text[i]); i += 1; continue
-            out.append(" ")
-            i = end + 2
-            continue
-        if text.startswith("$(", i):
-            depth, j = 1, i + 2
-            while j < len(text):
-                if text[j] == "(":
-                    depth += 1
-                elif text[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            inner.append(text[i + 2:j])
-            out.append(" ")
-            i = j + 1
-            continue
-        if text[i] == "`":
-            end = text.find("`", i + 1)
-            if end == -1:
-                out.append(text[i]); i += 1; continue
-            inner.append(text[i + 1:end])
-            out.append(" ")
-            i = end + 1
-            continue
-        out.append(text[i])
-        i += 1
+            if quote == '"':
+                if ch == "\\" and i + 1 < len(raw):
+                    line.append(ch); line.append(raw[i + 1]); i += 2; continue
+                if raw.startswith("$(", i):
+                    chunk, i = read_until(raw, i + 2, ")")
+                    nested.append(chunk); line.append(" "); continue
+                if ch == "`":
+                    chunk, i = read_until(raw, i + 1, "`")
+                    nested.append(chunk); line.append(" "); continue
+                if ch == '"':
+                    quote = None
+                line.append(ch)
+                i += 1
+                continue
 
-    nested = []
-    for chunk in inner:
-        rest, deeper = pull_substitutions(chunk)
-        nested.append(rest)
-        nested.extend(deeper)
-    return "".join(out), nested
+            # вне кавычек
+            if ch == "\\" and i + 1 < len(raw):
+                line.append(ch); line.append(raw[i + 1]); i += 2; word_start = False; continue
+            if ch == "#" and word_start:
+                break
+            if ch in "'\"":
+                quote = ch
+                line.append(ch); i += 1; word_start = False; continue
+            if raw.startswith("$((", i):
+                end = raw.find("))", i)
+                line.append(" ")
+                i = len(raw) if end == -1 else end + 2
+                continue
+            if raw.startswith("$(", i):
+                chunk, i = read_until(raw, i + 2, ")")
+                nested.append(chunk); line.append(" "); word_start = False; continue
+            if ch == "`":
+                chunk, i = read_until(raw, i + 1, "`")
+                nested.append(chunk); line.append(" "); word_start = False; continue
+            if raw.startswith("<<", i):
+                mark, after = read_heredoc_mark(raw, i)
+                if mark is not None:
+                    pending.append(mark)
+                    i = after
+                    continue
+            line.append(ch)
+            word_start = ch in " \t;&|()"
+            i += 1
+
+        out_lines.append("".join(line))
+
+    deeper = []
+    for chunk in list(nested):
+        text, more = preprocess(chunk)
+        deeper.append(text)
+        deeper.extend(more)
+    return "\n".join(out_lines), deeper
 
 
 def parse(command):
@@ -159,7 +212,7 @@ def parse(command):
     многострочный скрипт слипался в одну команду, и `rm -rf /tmp/x` на первой
     строке забирал в «цели удаления» слова со всех остальных.
     """
-    text, nested = pull_substitutions(re.sub(r"\\\n", " ", strip_heredocs(command)))
+    text, nested = preprocess(re.sub(r"\\\n", " ", command))
     if nested:
         # Команда внутри `$( … )` — такая же команда, просто написанная внутри
         # другой. Разбираем её отдельной строкой.
@@ -189,20 +242,16 @@ def parse(command):
     KEYWORDS = {"do", "then", "else", "elif", "{", "}", "!", "(", ")"}
     ENDERS = {"done", "fi", "esac", ";;"}
 
-    commands, current, skip_next, comment = [], [], False, False
+    commands, current, skip_next = [], [], False
     redirects = []
     for index, token in enumerate(tokens):
-        if token == "\n":
-            comment = False
-        if comment:
-            continue
+        # Комментарии сняты в preprocess — здесь их искать нельзя: shlex уже
+        # убрал кавычки, и `git commit -m "#123 правка"` выглядел бы как
+        # комментарий, гасящий остаток строки вместе с настоящими командами.
         if skip_next:
             if not token.startswith("-"):
                 redirects.append(token)
             skip_next = False
-            continue
-        if token.startswith("#"):
-            comment = True
             continue
         if token in (";", "&&", "||", "|", "&", "\n", "|&", ";;") or token in KEYWORDS or token in ENDERS:
             if current:
