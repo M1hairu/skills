@@ -192,6 +192,18 @@ check_repo() {
     [[ -f "$f" ]] && scan_secrets "$f"
   done
 
+  # Всё, что git готов отправить в публичный репозиторий, — включая файлы,
+  # начинающиеся с точки: маска `*.md` их не берёт, и однажды из-за этого
+  # в коммиты уехали полторы тысячи строк черновиков с домашними путями.
+  if [[ -d "$REPO/.git" ]]; then
+    while IFS= read -r f; do
+      [[ -f "$REPO/$f" ]] || continue
+      case "$f" in
+        *.md|*.sh|*.py|*.json|*.txt) scan_secrets "$REPO/$f" ;;
+      esac
+    done < <(git -C "$REPO" -c core.quotepath=off ls-files 2>/dev/null)
+  fi
+
   printf '\n'
 }
 
