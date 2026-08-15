@@ -3,6 +3,7 @@
 #
 #   afk-autonomy --on      — включить для текущего каталога
 #   afk-autonomy --off     — выключить
+#   afk-autonomy --off --all — снять везде и вернуть настройки (при удалении скилла)
 #   afk-autonomy --status  — включена ли сейчас
 #
 # Режим сессии (`manual`, `acceptEdits`) на ходу не меняется — он задаётся при запуске
@@ -30,6 +31,7 @@ SETTINGS="$HOME/.claude/settings.local.json"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --on|--off|--status) ACTION="${1#--}"; shift ;;
+    --all)    ACTION=off-all; shift ;;
     --hook)   ACTION=hook; shift ;;
     --dir)    DIR="$(readlink -f "$2")"; shift 2 ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -68,7 +70,7 @@ listed() { [[ -f "$DIRS_FILE" ]] && grep -qxF "$DIR" "$DIRS_FILE"; }
 # проектные настройки сессия подхватывает не сразу, а пользовательские — на лету.
 ensure_hook() {
   mkdir -p "$(dirname "$SETTINGS")"
-  SELF="$SELF" python3 - "$SETTINGS" <<'PY'
+  python3 - "$SETTINGS" "$HOME/.claude/settings.json" <<'PY'
 import json, os, sys
 
 path = sys.argv[1]
@@ -79,11 +81,54 @@ try:
 except Exception:
     data = {}
 
+# Хук мог поставить установщик — в пользовательские настройки. Второй экземпляр
+# не добавляет защиты, а цену платит каждый вызов инструмента: хук запускается
+# дважды. Поэтому смотрим оба файла и ставим свой, только если его нигде нет.
+for other in sys.argv[2:]:
+    try:
+        with open(other) as f:
+            if command in json.dumps(json.load(f).get("hooks", {})):
+                sys.exit(0)
+    except Exception:
+        pass
+
 groups = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
 if command in json.dumps(groups):
     sys.exit(0)
 
 groups.append({"matcher": "*", "hooks": [{"type": "command", "command": command, "timeout": 10}]})
+with open(path, "w") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PY
+}
+
+# Хук, поставленный этой командой, надо и убирать ею же: установщик знает только
+# про свой (в settings.json), а этот живёт в settings.local.json и после снятия
+# скилла указывал бы на команду, которой больше нет.
+remove_hook() {
+  [[ -f "$SETTINGS" ]] || return 0
+  python3 - "$SETTINGS" <<'PY'
+import json, sys
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+
+hooks = data.get("hooks", {})
+groups = hooks.get("PreToolUse", [])
+kept = [g for g in groups if "afk-hook" not in json.dumps(g)]
+if len(kept) == len(groups):
+    sys.exit(0)
+if kept:
+    hooks["PreToolUse"] = kept
+else:
+    hooks.pop("PreToolUse", None)
+if not hooks:
+    data.pop("hooks", None)
 with open(path, "w") as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
     f.write("\n")
@@ -106,6 +151,17 @@ case "$ACTION" in
     bg_isolation on
     echo "автономность включена: разрешения больше не останавливают работу в $DIR"
     echo "опасное (ключи, sudo, форс-пуш, rm -rf вне проекта) хук по-прежнему отклоняет"
+    ;;
+
+  off-all)
+    # Снятие скилла: гасим автономность везде, где она осталась, и возвращаем
+    # настройки. Иначе `worktree.bgIsolation` переживёт удаление самого скилла.
+    if [[ -f "$DIRS_FILE" ]]; then
+      : > "$DIRS_FILE"
+    fi
+    bg_isolation off
+    remove_hook
+    echo "автономность снята со всех каталогов, настройки возвращены"
     ;;
 
   off)

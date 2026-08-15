@@ -633,21 +633,10 @@ case "$ACTION" in
       say "сторож уже приставлен к $DIR"
       exit 0
     fi
-    mkdir -p "$AFKDIR"
-    rm -f "$AFKDIR/stop"
-    # Отсчёт молчания начинается сейчас: heartbeat мог остаться с прошлой ночи,
-    # и без этого сторож с ходу решит, что живая сессия давно встала.
-    touch "$AFKDIR/heartbeat"
-    state_set started "$(now)"
-    state_set resumes 0
-    state_set last_resume 0
-    state_set hit_limit ""
-    state_set resume_sid "$(sessions | head -1 | cut -d'|' -f3)"
-
-    # Служебные файлы сторожа не должны попадать в ночные коммиты.
-    if [[ -d "$DIR/.git" ]] && ! grep -qs '^\.afk/$' "$DIR/.git/info/exclude"; then
-      mkdir -p "$DIR/.git/info" && echo '.afk/' >> "$DIR/.git/info/exclude"
-    fi
+    command -v systemd-run >/dev/null || {
+      echo "afk-watch: нет systemd-run — сторожа не поставить" >&2
+      exit 1
+    }
 
     # Текст, которым сторож будит и поднимает работу, задают снаружи: сессия
     # может жить не в каталоге проекта, и тогда «прочитай PLAN.md» ей ничего не даёт.
@@ -678,12 +667,35 @@ case "$ACTION" in
     [[ -n "${AFK_POLICY:-}" ]]        && ENV_ARGS+=(--setenv="AFK_POLICY=$AFK_POLICY")
     [[ -n "${AFK_PING_URL:-}" ]]      && ENV_ARGS+=(--setenv="AFK_PING_URL=$AFK_PING_URL")
 
-    systemd-run --user --unit "$UNIT" --collect \
+    # Состояние заводим только после успешного запуска: иначе каталог выглядит
+    # так, будто ночь идёт (свежий `heartbeat`, `.afk/`), а сторожа нет вовсе —
+    # и это самая дорогая ложь из возможных.
+    mkdir -p "$AFKDIR"
+    rm -f "$AFKDIR/stop"
+    # Отсчёт молчания начинается сейчас: heartbeat мог остаться с прошлой ночи,
+    # и без этого сторож с ходу решит, что живая сессия давно встала.
+    touch "$AFKDIR/heartbeat"
+    state_set started "$(now)"
+    state_set resumes 0
+    state_set last_resume 0
+    state_set hit_limit ""
+    state_set resume_sid "$(sessions | head -1 | cut -d'|' -f3)"
+
+    # Служебные файлы сторожа не должны попадать в ночные коммиты.
+    if [[ -d "$DIR/.git" ]] && ! grep -qs '^\.afk/$' "$DIR/.git/info/exclude"; then
+      mkdir -p "$DIR/.git/info" && echo '.afk/' >> "$DIR/.git/info/exclude"
+    fi
+
+    if ! systemd-run --user --unit "$UNIT" --collect \
       --description "Сторож ночной сессии Claude Code в $DIR" \
       "${ENV_ARGS[@]}" \
       systemd-inhibit --what=sleep:handle-lid-switch \
         --who=afk-watch --why="ночная работа Claude Code" \
-        "$SELF" --daemon --dir "$DIR" >/dev/null
+        "$SELF" --daemon --dir "$DIR" >/dev/null; then
+      rm -f "$AFKDIR/heartbeat" "$STATE"
+      echo "afk-watch: сторож не запустился — работа останется без присмотра" >&2
+      exit 1
+    fi
     say "сторож приставлен к $DIR: ждёт .afk/heartbeat, поднимает работу после лимита и обрыва связи."
     say "посмотреть — afk-watch --status, снять — afk-watch --stop"
     ;;
@@ -707,7 +719,9 @@ case "$ACTION" in
     [[ "$broke" =~ ^[0-9]+$ ]] && say "сессия оборвана $(( broke / 60 )) мин назад и с тех пор молчит"
     resumes="$(state_num resumes)"
     (( resumes > 0 )) && say "работа поднималась заново $resumes раз"
-    [[ -f "$LOGFILE" ]] && { say ""; tail -5 "$LOGFILE"; }
+    # Последняя строка ветки не должна решать код возврата: ночью `--status`
+    # смотрит агент, и ненулевой код он читает как «команда не сработала».
+    [[ -f "$LOGFILE" ]] && { say ""; tail -5 "$LOGFILE"; } || true
     ;;
 
   once)
