@@ -42,7 +42,10 @@ IDLE_MIN="${AFK_IDLE_MIN:-30}"
 WEEKLY_FLOOR="${AFK_WEEKLY_FLOOR:-90}"
 MAX_RESUMES="${AFK_MAX_RESUMES:-6}"
 CHECK_SEC="${AFK_CHECK_SEC:-300}"
-MODE="${AFK_PERMISSION_MODE:-dontAsk}"
+# Поднятая ночью сессия работает без вопросов и без молчаливых отказов: любой
+# другой режим глушит часть работы (правки, сеть, сборку), а спросить некого.
+# Границу держит хук — он отклоняет опасное и в этом режиме.
+MODE="${AFK_PERMISSION_MODE:-bypassPermissions}"
 
 ACTION=""
 DIR="$PWD"
@@ -365,8 +368,8 @@ start_session() {
     return 0
   fi
 
-  # Без автономности поднятая сессия немая: в dontAsk любая команда, требующая
-  # разрешения, молча отклоняется, и работа не двигается.
+  # Автономность ставит хук (граница ночи) и снимает изоляцию фоновых сессий,
+  # без которой поднятая работа не может править файлы проекта.
   command -v afk-autonomy >/dev/null && afk-autonomy --on --dir "$DIR" >/dev/null 2>&1 || true
 
   if start_in_tmux "$sid"; then
