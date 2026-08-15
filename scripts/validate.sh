@@ -100,6 +100,24 @@ check_skill() {
     done
   fi
 
+  # Остальной код скилла: setup.sh запускает установщик, lib/ подключают скрипты,
+  # hook/ вызывается на каждый инструмент — синтаксическая ошибка там ломает ночь
+  # так же, как в bin/, а раньше проверялся только bin/.
+  if [[ -f "$dir/setup.sh" ]]; then
+    [[ -x "$dir/setup.sh" ]] || err "setup.sh не исполняемый (chmod +x)"
+    bash -n "$dir/setup.sh" 2>/dev/null || err "setup.sh: синтаксическая ошибка"
+  fi
+  for f in "$dir"/lib/*.sh; do
+    [[ -f "$f" ]] || continue
+    bash -n "$f" 2>/dev/null || err "lib/$(basename "$f"): синтаксическая ошибка"
+  done
+  for f in "$dir"/hook/*.py "$dir"/bin/*.py; do
+    [[ -f "$f" ]] || continue
+    python3 -m py_compile "$f" 2>/dev/null || err "$(basename "$f"): синтаксическая ошибка"
+    grep -q "$HOME/" "$f" && warn "$(basename "$f") содержит домашний путь — репозиторий публичный"
+  done
+  rm -rf "$dir/hook/__pycache__" "$dir/bin/__pycache__" 2>/dev/null || true
+
   # ── инварианты: где скилл обязан быть упомянут ──
   local entry="./skills/$rel"
   if [[ "$category" == "deprecated" ]]; then

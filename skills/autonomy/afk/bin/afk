@@ -72,8 +72,10 @@ command -v afk-limits >/dev/null && afk-limits || true
 [[ "$HOOK" == 1 ]] && command -v afk-autonomy >/dev/null && afk-autonomy --on || true
 
 # Сторож поднимет работу, если ночью кончится пятичасовое окно или оборвётся связь.
+# `AFK_HOOK` он передаст поднятой сессии: без этого `--yolo` обещал бы работу без
+# страховки, а первый же подъём возвращал хук обратно.
 if [[ "$WATCH" == 1 ]] && command -v afk-watch >/dev/null; then
-  AFK_PERMISSION_MODE="$MODE" afk-watch --start || true
+  AFK_PERMISSION_MODE="$MODE" AFK_HOOK="$HOOK" afk-watch --start || true
 fi
 
 NAME="afk-$(basename "$PWD")"

@@ -3,3 +3,6 @@
 !*.example.env
 *.backup-*
 .DS_Store
+__pycache__/
+*.pyc
+.afk/

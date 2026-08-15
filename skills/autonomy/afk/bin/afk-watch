@@ -369,8 +369,11 @@ start_session() {
   fi
 
   # Автономность ставит хук (граница ночи) и снимает изоляцию фоновых сессий,
-  # без которой поднятая работа не может править файлы проекта.
-  command -v afk-autonomy >/dev/null && afk-autonomy --on --dir "$DIR" >/dev/null 2>&1 || true
+  # без которой поднятая работа не может править файлы проекта. `AFK_HOOK=0`
+  # приходит от `afk --yolo`: человек попросил ночь без страховки, и возвращать
+  # её за его спиной нельзя.
+  [[ "${AFK_HOOK:-1}" == 1 ]] && command -v afk-autonomy >/dev/null \
+    && afk-autonomy --on --dir "$DIR" >/dev/null 2>&1 || true
 
   if start_in_tmux "$sid"; then
     state_set resumes "$(( $(state_num resumes) + 1 ))"
@@ -665,7 +668,7 @@ case "$ACTION" in
     fi
 
     # Без графических переменных сторож не сможет открыть окно из юнита.
-    for var in AFK_TERMINAL WAYLAND_DISPLAY DISPLAY DBUS_SESSION_BUS_ADDRESS \
+    for var in AFK_TERMINAL AFK_HOOK WAYLAND_DISPLAY DISPLAY DBUS_SESSION_BUS_ADDRESS \
                HYPRLAND_INSTANCE_SIGNATURE XDG_CURRENT_DESKTOP; do
       [[ -n "${!var:-}" ]] && ENV_ARGS+=(--setenv="$var=${!var}")
     done

@@ -61,35 +61,119 @@ def watched_dirs(dirs_file):
         return []
 
 
-def strip_heredocs(command):
-    """Тело heredoc — данные, а не команды: их разбирать нельзя."""
-    out, skip_until = [], None
-    for line in command.splitlines():
-        if skip_until is not None:
-            if line.strip() == skip_until:
-                skip_until = None
+# Оператор heredoc: `<<` или `<<-`, дальше ограничитель — слово в кавычках,
+# со слэшем или голое. Отличаем от сдвига влево в коде (`1 << n`): там дальше
+# идёт число или переменная, а не имя-ограничитель, и перед `<<` не бывает
+# пробела-с-именем... надёжнее смотреть на сам ограничитель.
+HEREDOC = re.compile(r"<<-?\s*(?:'(?P<q1>[^']+)'|\"(?P<q2>[^\"]+)\"|\\(?P<esc>\S+)|(?P<bare>[^\s;&|<>()\"'`]+))")
+
+
+def heredoc_marks(line):
+    """Ограничители heredoc, открытые в этой строке, и позиция первого из них."""
+    marks, start = [], None
+    for match in HEREDOC.finditer(line):
+        word = match.group("q1") or match.group("q2") or match.group("esc") or match.group("bare")
+        # `$((1 << n))`, `x=$((a<<2))`, `print(1 << shift)` — это сдвиг, не heredoc.
+        if re.fullmatch(r"[-+]?\d+\)*", word) or word.startswith(("$", "-")):
             continue
-        match = re.search(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?", line)
-        if match:
-            skip_until = match.group(1)
-            line = line[:match.start()]
+        marks.append(word)
+        if start is None:
+            start = match.start()
+    return marks, start
+
+
+def strip_heredocs(command):
+    """Тело heredoc — данные, а не команды: их разбирать нельзя.
+
+    В одной строке heredoc может быть несколько (`cmd <<A <<B`), тела идут
+    подряд, ограничитель бывает в кавычках, со слэшем и не из латиницы.
+    """
+    out, pending = [], []
+    for line in command.splitlines():
+        if pending:
+            if line.strip() == pending[0]:
+                pending.pop(0)
+            continue
+        marks, start = heredoc_marks(line)
+        if marks:
+            pending = marks
+            line = line[:start]
         out.append(line)
     return "\n".join(out)
 
 
-def split_commands(command):
-    """Команда → список списков токенов, по одному на каждую простую команду.
+def pull_substitutions(text):
+    """Вырезать `$( … )` и обратные кавычки, вернув (остаток, вложенные команды).
+
+    Внутри подстановки стоит настоящая команда: `echo "$(cat ~/.ssh/id_rsa)"`
+    читает ключ, хотя снаружи виден безобидный `echo`. Разбирать её надо
+    отдельно, иначе безопасной выглядит любая обёртка.
+    """
+    out, inner, i = [], [], 0
+    while i < len(text):
+        # `$(( … ))` — арифметика, команд там нет.
+        if text.startswith("$((", i):
+            end = text.find("))", i)
+            if end == -1:
+                out.append(text[i]); i += 1; continue
+            out.append(" ")
+            i = end + 2
+            continue
+        if text.startswith("$(", i):
+            depth, j = 1, i + 2
+            while j < len(text):
+                if text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            inner.append(text[i + 2:j])
+            out.append(" ")
+            i = j + 1
+            continue
+        if text[i] == "`":
+            end = text.find("`", i + 1)
+            if end == -1:
+                out.append(text[i]); i += 1; continue
+            inner.append(text[i + 1:end])
+            out.append(" ")
+            i = end + 1
+            continue
+        out.append(text[i])
+        i += 1
+
+    nested = []
+    for chunk in inner:
+        rest, deeper = pull_substitutions(chunk)
+        nested.append(rest)
+        nested.extend(deeper)
+    return "".join(out), nested
+
+
+def parse(command):
+    """Команда → (список простых команд, пути из редиректов).
 
     Разбираем построчно: для shlex перевод строки — обычный пробел, поэтому
     многострочный скрипт слипался в одну команду, и `rm -rf /tmp/x` на первой
     строке забирал в «цели удаления» слова со всех остальных.
     """
-    text = re.sub(r"\\\n", " ", strip_heredocs(command))
+    text, nested = pull_substitutions(re.sub(r"\\\n", " ", strip_heredocs(command)))
+    if nested:
+        # Команда внутри `$( … )` — такая же команда, просто написанная внутри
+        # другой. Разбираем её отдельной строкой.
+        text = "\n".join([text] + nested)
+
     tokens, buffer = [], ""
     for line in text.split("\n"):
         buffer = buffer + "\n" + line if buffer else line
         lexer = shlex.shlex(buffer, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
+        # Комментарий у shlex начинается с `#` в любом месте слова, у оболочки —
+        # только в начале. Из-за этого `git commit -m fix#12 && rm -rf /etc`
+        # обрывался на `fix`, и остаток строки не проверялся вовсе.
+        lexer.commenters = ""
         try:
             tokens.extend(list(lexer))
         except ValueError:
@@ -100,32 +184,53 @@ def split_commands(command):
     if buffer:
         tokens.extend(buffer.split())
 
-    commands, current, skip_next = [], [], False
-    for token in tokens:
+    # Слова, после которых начинается новая команда: без них
+    # `for f in a b; do rm -rf /etc; done` выглядит как одна команда `for`.
+    KEYWORDS = {"do", "then", "else", "elif", "{", "}", "!", "(", ")"}
+    ENDERS = {"done", "fi", "esac", ";;"}
+
+    commands, current, skip_next, comment = [], [], False, False
+    redirects = []
+    for index, token in enumerate(tokens):
+        if token == "\n":
+            comment = False
+        if comment:
+            continue
         if skip_next:
+            if not token.startswith("-"):
+                redirects.append(token)
             skip_next = False
             continue
-        if token in (";", "&&", "||", "|", "&", "\n", "|&"):
+        if token.startswith("#"):
+            comment = True
+            continue
+        if token in (";", "&&", "||", "|", "&", "\n", "|&", ";;") or token in KEYWORDS or token in ENDERS:
             if current:
                 commands.append(current)
             current = []
             continue
         # Редирект и его цель — не аргументы команды: иначе `rm -rf build > /dev/null`
-        # читается как попытка удалить /dev/null.
+        # читается как попытка удалить /dev/null. Но путь запоминаем: `< ключ`
+        # и `>> ~/.ssh/authorized_keys` — обращение к файлу, просто не удаление.
         if re.match(r"^\d*(>>?|<|&>|>&)$", token):
             skip_next = True
             continue
-        if re.match(r"^\d*(>>?|&>)\S", token):
+        if re.match(r"^\d*(>>?|&>|<)\S", token):
+            redirects.append(re.sub(r"^\d*(>>?|&>|<)", "", token))
             continue
-        # Скобки группировки выбрасываем целиком, но из обычных токенов ничего
-        # не срезаем: `strip("(){}")` превращал `${HOME}` в `${HOME` и ломал
-        # проверку самого разрушительного пути.
-        if token in ("(", ")", "{", "}"):
+        # Номер дескриптора перед оператором (`2>&1`) — не аргумент команды.
+        if token.isdigit() and index + 1 < len(tokens) and \
+                re.match(r"^(>>?|<|&>|>&)", tokens[index + 1]):
             continue
         current.append(token)
     if current:
         commands.append(current)
-    return [c for c in commands if c]
+    return [c for c in commands if c], redirects
+
+
+def split_commands(command):
+    """Только команды, без путей из редиректов."""
+    return parse(command)[0]
 
 
 def peel(words):
@@ -207,16 +312,37 @@ def deletion_targets(args, cwd):
 PRINTERS = {"echo", "printf", ":", "true", "false"}
 
 
-def secret_paths(command):
-    """Части команды, где путь к ключам означает обращение к ним."""
-    out = []
-    for words in split_commands(command):
+def secret_tokens(command):
+    """Слова команды, в которых путь к ключам означает обращение к ним.
+
+    Печатающие команды пропускаем — напечатать путь не то же самое, что его
+    прочитать, — а вот файл из редиректа считаем: `curl -d @- < ключ` читает
+    его так же, как `cat`.
+    """
+    commands, redirects = parse(command)
+    out = list(redirects)
+    for words in commands:
         name, args = peel(words)
         if not name or name in PRINTERS:
             continue
         out.append(name)
         out.extend(args)
-    return " ".join(out)
+    return out
+
+
+def secret_hit(tokens):
+    """Первое слово, которым трогают ключи или учётные данные."""
+    for raw in tokens:
+        token = str(raw).strip("'\"")
+        for pattern in SECRETS:
+            if re.search(pattern, token):
+                return token
+        # `.env` ловим по имени файла, а не по подстроке: `afk.env` и
+        # `prod.env` — те же секреты, а `process.env` в коде — не файл.
+        if ("/" in token or token.startswith(("~", "."))) and \
+                os.path.basename(token).endswith(".env"):
+            return token
+    return None
 
 
 def check_bash(command, cwd, home):
@@ -248,7 +374,7 @@ def check_bash(command, cwd, home):
         if name == "dd" and any(a.startswith("of=/dev/") for a in args):
             return "deny", "запись на устройство"
 
-        if name == "cd" and args:
+        if name in ("cd", "pushd") and args:
             here = resolve(args[0], here)
             continue
 
@@ -263,8 +389,10 @@ def check_bash(command, cwd, home):
         # проекта. Формы разные — `-d @файл`, `-T файл`, `--post-file=файл`, —
         # и каждая пишется ночью не задумываясь.
         if name in ("curl", "wget"):
-            takes_file = {"-T", "--upload-file", "--post-file", "-d", "--data",
-                          "--data-binary", "--data-raw", "--data-ascii", "-F", "--form"}
+            # Только флаги, которые сами по себе означают файл. `-d /путь` без `@`
+            # отправляет строку, а не содержимое, и отклонять его — врать человеку.
+            takes_file = {"-T", "--upload-file", "--post-file", "--body-file",
+                          "-K", "--config"}
             candidates, expect_file = [], False
             for arg in args:
                 if expect_file:
@@ -319,6 +447,11 @@ def check_bash(command, cwd, home):
                         for a in args)
 
         if name in DELETERS and (recursive or name != "rm"):
+            # Переменная плюс переход вверх — путь может выйти куда угодно
+            # (`/tmp/$X/../../home/имя`), и видимый префикс тут не помогает.
+            for arg in args:
+                if "$" in arg and ".." in arg:
+                    return "deny", f"путь с переменной и переходом вверх ({arg})"
             for target in deletion_targets(args, here):
                 if any(inside(target, s) for s in scratch):
                     continue
@@ -331,7 +464,8 @@ def check_bash(command, cwd, home):
                 if not inside(target, project):
                     return "deny", f"рекурсивное удаление вне проекта ({target})"
 
-        if name == "find" and ("-delete" in args or ("-exec" in args and "rm" in args)):
+        if name == "find" and ("-delete" in args or
+                               ("-exec" in args and any(os.path.basename(a) in DELETERS for a in args))):
             root = deletion_targets([a for a in args if not a.startswith("-")][:1], here)
             if root and not inside(root[0], project) and not any(inside(root[0], s) for s in scratch):
                 return "deny", f"массовое удаление вне проекта ({root[0]})"
@@ -379,16 +513,15 @@ def main() -> int:
                 return ""
             return " ".join(w for w in text.split() if w.startswith(("/", "~", ".")) or "/" in w)
 
-        paths = path_like(data)
+        tokens = path_like(data).split()
     else:
-        paths = " ".join(str(data.get(key, "")) for key in
-                         ("file_path", "notebook_path", "path"))
+        tokens = [str(data.get(key, "")) for key in ("file_path", "notebook_path", "path")]
         if data.get("command"):
-            paths += " " + secret_paths(str(data["command"]))
-    for pattern in SECRETS:
-        if re.search(pattern, paths):
-            emit("deny", "ключи и учётные данные ночью не трогаем — запиши в BLOCKED.md",
-                 event, state_dir)
+            tokens += secret_tokens(str(data["command"]))
+
+    if secret_hit(tokens):
+        emit("deny", "ключи и учётные данные ночью не трогаем — запиши в BLOCKED.md",
+             event, state_dir)
 
     if tool == "Bash":
         verdict = check_bash(str(data.get("command", "")), cwd, home)
