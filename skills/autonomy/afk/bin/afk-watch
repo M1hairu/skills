@@ -88,7 +88,10 @@ running_unit() {
   local u
   while read -r u; do
     [[ -n "$u" ]] || continue
-    if systemctl --user show "$u" -p Description --value 2>/dev/null | grep -qF " в $DIR"; then
+    # Каталог стоит в конце описания, и сравнивать надо именно с концом: поиск
+    # подстроки " в /home/имя" совпадал и со сторожем вложенного проекта,
+    # и `--stop` снимал чужую охрану вместо своей.
+    if [[ "$(systemctl --user show "$u" -p Description --value 2>/dev/null)" == *" в $DIR" ]]; then
       printf '%s\n' "${u%.service}"
       return 0
     fi
