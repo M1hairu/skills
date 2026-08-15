@@ -263,6 +263,19 @@ check_requires() {
   return 0
 }
 
+# Разовая настройка скилла: у кого есть setup.sh, тот сам спросит нужное
+# и запишет ответ в ~/.config/claude-skills/. Установщику знать, о чём именно
+# спрашивают, не требуется.
+run_setup() {
+  local file="$1/setup.sh"
+  [[ -f "$file" ]] || return 0
+  if (( DRY )); then
+    dim "выполнил бы настройку: setup.sh"
+    return 0
+  fi
+  SKILLS_ASSUME_YES="$ASSUME_YES" bash "$file" || warn "настройка скилла не прошла"
+}
+
 install_skill() {
   local rel="$1" dir="$SKILLS_DIR/$1" name="${1##*/}" f d
   say "$rel"
@@ -286,6 +299,7 @@ install_skill() {
 
   settings_rules "$dir" add
   check_requires "$dir"
+  run_setup "$dir"
 }
 
 uninstall_skill() {

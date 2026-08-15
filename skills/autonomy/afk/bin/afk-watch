@@ -17,6 +17,26 @@
 set -euo pipefail
 
 SELF="$(readlink -f "$0")"
+
+# Настройки, выбранные при установке (какой терминал открывать, например).
+# Файл не исполняется: читаем только строки вида AFK_ИМЯ=значение, и то,
+# что уже задано в окружении, оставляем как есть.
+load_conf() {
+  local conf key value line
+  conf="${AFK_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-skills/afk.env}"
+  [[ -f "$conf" ]] || return 0
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*# || -z "${line// }" ]] && continue
+    key="${line%%=*}"; value="${line#*=}"
+    key="${key//[[:space:]]/}"
+    [[ "$key" =~ ^AFK_[A-Z_]+$ ]] || continue
+    [[ -n "${!key:-}" ]] && continue
+    value="${value#[\"\']}"; value="${value%[\"\']}"
+    printf -v "$key" '%s' "$value"
+  done < "$conf"
+}
+load_conf
+
 POLICY="${AFK_POLICY:-$HOME/.claude/afk-policy.md}"
 IDLE_MIN="${AFK_IDLE_MIN:-30}"
 WEEKLY_FLOOR="${AFK_WEEKLY_FLOOR:-90}"
@@ -300,6 +320,42 @@ start_in_tmux() {
   return 0
 }
 
+# Вернуть работу человеку на глаза: окно терминала с уже подключённой сессией.
+# Иначе ночной переезд в tmux человек утром просто не найдёт — он видит тот же
+# терминал, из которого сессия ушла. Открываем только когда к окну никто
+# не подключён, иначе за ночь их накопится десяток.
+open_window() {
+  local term lib
+  [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]] || return 0
+  command -v tmux >/dev/null || return 0
+  tmux list-clients -t "$TARGET" 2>/dev/null | grep -q . && return 0
+
+  term="${AFK_TERMINAL:-}"
+  if [[ -z "$term" ]]; then
+    lib="$(dirname "$SELF")/../lib/terminal.sh"
+    # shellcheck disable=SC1090
+    [[ -f "$lib" ]] && . "$lib" && term="$(afk_detect_terminal || true)"
+  fi
+  [[ -n "$term" ]] || return 0
+
+  if [[ "$DRY" == 1 ]]; then
+    log "открыл бы окно: $term tmux attach -t $TARGET"
+    return 0
+  fi
+
+  # Отдельным юнитом: окно должно пережить и сторожа, и конец ночи.
+  # Слова в $term не в кавычках намеренно — там команда вместе с флагом.
+  # shellcheck disable=SC2086
+  systemd-run --user --unit "afk-window-$SLUG" --collect --quiet -- \
+    $term tmux attach -t "$TARGET" 2>/dev/null \
+    || setsid -f $term tmux attach -t "$TARGET" >/dev/null 2>&1 \
+    || return 0
+
+  command -v notify-send >/dev/null && \
+    notify-send -a afk "Работа продолжается" "Окно «$TARGET» открыто — ночная сессия в нём" 2>/dev/null || true
+  log "открыл окно с работой ($term)"
+}
+
 start_session() {
   local sid="$1" why="$2" args=() out id verdict
 
@@ -318,6 +374,7 @@ start_session() {
     state_set last_resume "$(now)"
     log "работа поднята в окне tmux «$TARGET» ($why) — утром «tmux attach -t $TARGET»"
     journal "работа поднята заново ($why) в окне tmux «$TARGET»"
+    open_window
     return 0
   fi
 
@@ -596,6 +653,20 @@ case "$ACTION" in
       --setenv="AFK_PERMISSION_MODE=$MODE"
       --setenv="PATH=$PATH"
     )
+    # Терминал определяем здесь, пока сторож ещё запущен из окна человека:
+    # из юнита дерево процессов ведёт к systemd, а не к терминалу.
+    if [[ -z "${AFK_TERMINAL:-}" && -f "$(dirname "$SELF")/../lib/terminal.sh" ]]; then
+      # shellcheck disable=SC1090
+      . "$(dirname "$SELF")/../lib/terminal.sh"
+      AFK_TERMINAL="$(afk_detect_terminal || true)"
+    fi
+
+    # Без графических переменных сторож не сможет открыть окно из юнита.
+    for var in AFK_TERMINAL WAYLAND_DISPLAY DISPLAY DBUS_SESSION_BUS_ADDRESS \
+               HYPRLAND_INSTANCE_SIGNATURE XDG_CURRENT_DESKTOP; do
+      [[ -n "${!var:-}" ]] && ENV_ARGS+=(--setenv="$var=${!var}")
+    done
+
     [[ -n "${AFK_RESUME_PROMPT:-}" ]] && ENV_ARGS+=(--setenv="AFK_RESUME_PROMPT=$AFK_RESUME_PROMPT")
     [[ -n "${AFK_NUDGE_TEXT:-}" ]]    && ENV_ARGS+=(--setenv="AFK_NUDGE_TEXT=$AFK_NUDGE_TEXT")
     [[ -n "${AFK_POLICY:-}" ]]        && ENV_ARGS+=(--setenv="AFK_POLICY=$AFK_POLICY")
