@@ -117,7 +117,12 @@ def split_commands(command):
             continue
         if re.match(r"^\d*(>>?|&>)\S", token):
             continue
-        current.append(token.strip("(){}"))
+        # Скобки группировки выбрасываем целиком, но из обычных токенов ничего
+        # не срезаем: `strip("(){}")` превращал `${HOME}` в `${HOME` и ломал
+        # проверку самого разрушительного пути.
+        if token in ("(", ")", "{", "}"):
+            continue
+        current.append(token)
     if current:
         commands.append(current)
     return [c for c in commands if c]
@@ -141,12 +146,26 @@ def peel(words):
     return "", []
 
 
+def expand_vars(path, cwd):
+    """Раскрыть переменные, значение которых известно и здесь: `$HOME`, `$PWD`.
+
+    Формы разные — `$HOME`, `${HOME}`, `${HOME:-/home/имя}`, — и все означают одно.
+    """
+    home = os.path.expanduser("~").rstrip("/")
+    known = {"HOME": home, "PWD": cwd, "OLDPWD": cwd,
+             "USER": os.path.basename(home), "LOGNAME": os.path.basename(home)}
+
+    def repl(match):
+        name = match.group("name")
+        return known.get(name, match.group(0))
+
+    path = re.sub(r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(:[-=?+][^}]*)?\}", repl, path)
+    path = re.sub(r"\$(?P<name>[A-Za-z_][A-Za-z0-9_]*)", repl, path)
+    return path
+
+
 def resolve(path, cwd):
-    path = os.path.expanduser(path.strip("'\""))
-    for form in ("${HOME}", "$HOME"):
-        if path.startswith(form):
-            path = os.path.expanduser("~") + path[len(form):]
-            break
+    path = expand_vars(os.path.expanduser(path.strip("'\"")), cwd)
     if not os.path.isabs(path):
         path = os.path.join(cwd, path)
     return os.path.normpath(path)
@@ -168,9 +187,17 @@ def deletion_targets(args, cwd):
     for arg in args:
         if arg.startswith("-"):
             continue
-        if "$" in arg and not arg.startswith("$HOME") and "${HOME}" not in arg:
-            continue
-        out.append(resolve(arg, cwd))
+        path = expand_vars(arg.strip("'\""), cwd)
+        if "$" in path:
+            # Осталась чужая переменная. Пропускать весь путь нельзя: в
+            # `/home/$USER/Документы` и `/etc/$X` видимая часть уже говорит, куда
+            # метит команда. Проверяем этот префикс; если он пуст или относителен,
+            # цель действительно неизвестна — не выдумываем.
+            head = path.split("$", 1)[0]
+            if not head.startswith(("/", "~")):
+                continue
+            path = head
+        out.append(resolve(path, cwd))
     return out
 
 
