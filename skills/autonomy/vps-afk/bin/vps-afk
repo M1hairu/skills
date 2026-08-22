@@ -42,6 +42,8 @@ PROJECTS_REL="${VPS_AFK_PROJECTS:-projects}"
 RUNNER_REL="${VPS_AFK_RUNNER:-skills/autonomous-loop/runner.py}"
 TOPICS_REL="${VPS_AFK_TOPICS:-}"
 LOGS_REL="${VPS_AFK_LOGS:-.afk/runs}"
+TAKOPI_REL="${VPS_AFK_TAKOPI:-.takopi/takopi.toml}"
+TAKOPI_UNIT="${VPS_AFK_TAKOPI_UNIT:-takopi}"
 
 BRANCH=""
 SEND=""
@@ -109,9 +111,23 @@ if [[ -n "$SEND" ]]; then
   done
 fi
 
-# ── 4. Чат проекта, если он настроен ──
+# ── 4. Чат проекта: сперва бот узнаёт проект, потом заводится топик ──
+# Алиас — строчными: бот держит проекты в словаре с приведёнными к нижнему регистру
+# ключами, а имя из топика ищет в нём как есть. Разойдись регистр — топик отвечает
+# «unknown project», хотя проект описан.
+PROJECT_KEY=$(printf '%s' "$PROJECT" | tr '[:upper:]' '[:lower:]')
+
 if [[ -n "$TOPICS_REL" ]]; then
-  ssh "$VPS" "python3 \"\$HOME/$TOPICS_REL\" ensure '$PROJECT' --branch '$BRANCH' >/dev/null && echo '→ чат проекта готов'"
+  ssh "$VPS" "set -e
+    TOML=\"\$HOME/$TAKOPI_REL\"
+    if [ -f \"\$TOML\" ] && ! grep -qiE '^\[projects\.$PROJECT_KEY\]' \"\$TOML\"; then
+      printf '\n[projects.%s]\npath = \"%s\"\n' '$PROJECT_KEY' \"\$HOME/$PROJECTS_REL/$PROJECT\" >>\"\$TOML\"
+      systemctl --user restart '$TAKOPI_UNIT' \
+        || echo 'vps-afk: перезапусти $TAKOPI_UNIT сам, иначе бот не увидит проект' >&2
+      echo '→ проект вписан в $TAKOPI_REL'
+    fi
+    python3 \"\$HOME/$TOPICS_REL\" ensure '$PROJECT_KEY' --branch '$BRANCH' >/dev/null
+    echo '→ чат проекта готов'"
 fi
 
 # ── 5. Запуск прогона: переживает разрыв ssh и закрытый ноутбук ──
