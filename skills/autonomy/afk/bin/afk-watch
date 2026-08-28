@@ -46,6 +46,10 @@ CHECK_SEC="${AFK_CHECK_SEC:-300}"
 # другой режим глушит часть работы (правки, сеть, сборку), а спросить некого.
 # Границу держит хук — он отклоняет опасное и в этом режиме.
 MODE="${AFK_PERMISSION_MODE:-bypassPermissions}"
+# Пауза после `--start`, пока сессии в каталоге ещё нет: `afk` ставит сторожа
+# раньше, чем запускает Claude Code, и без паузы сторож успевал завести вторую
+# сессию — человек попадал в неё вместо своей.
+START_GRACE="${AFK_START_GRACE:-120}"
 
 ACTION=""
 DIR="$PWD"
@@ -127,19 +131,73 @@ now() { date +%s; }
 # Возраст файла в секундах; несуществующего — заведомо большой.
 age_of() { if [[ -e "$1" ]]; then echo $(( $(now) - $(stat -c %Y "$1") )); else echo 999999; fi; }
 
-# Сессии Claude Code в этом каталоге, свежая первой: kind|pid|sessionId|status|startedAt|name
+# Работа в этом каталоге: сессии Claude Code, свежая первой.
+# Поля — kind|pid|sessionId|status|startedAt|name|own
+#
+# Кроме сессий с cwd == каталог, сюда попадает сессия-хозяйка — та, из которой
+# сторожа позвали (пометка «own» в последнем поле). Она может жить в другом
+# каталоге: запущенный из ~ Claude Code работает в проекте через `cd`, а в
+# `claude agents` у него так и остаётся cwd=$HOME. По каталогу такую сессию
+# не найти — сторож считал её исчезнувшей и поднимал дубль поверх идущей работы.
 sessions() {
   claude agents --json 2>/dev/null | python3 -c '
 import json, sys
-target = sys.argv[1]
+target, own_pid, own_sid = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
-    rows = [r for r in json.load(sys.stdin) if r.get("cwd") == target]
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+rows, seen = [], set()
+for r in data:
+    sid = str(r.get("sessionId") or "")
+    own = ""
+    if r.get("cwd") != target:
+        # Хозяйку сверяем по паре pid+sessionId: pid в системе переиспользуется,
+        # и одного его мало, чтобы признать чужой процесс своей сессией.
+        if not (own_sid and sid == own_sid and (not own_pid or str(r.get("pid")) == own_pid)):
+            continue
+        own = "own"
+    if sid in seen:
+        continue
+    seen.add(sid)
+    rows.append((r, own))
+rows.sort(key=lambda pair: pair[0].get("startedAt") or 0, reverse=True)
+for r, own in rows:
+    fields = [str(r.get(k, "")) for k in ("kind", "pid", "sessionId", "status", "startedAt", "name")]
+    print("|".join(fields + [own]))
+' "$DIR" "$(state_get owner_pid)" "$(state_get owner_sid)" 2>/dev/null || true
+}
+
+# Процесс сессии, из которой запускают сторожа: `afk-watch --start` выполняет
+# Bash самой сессии, поэтому её `claude` — наш предок по дереву процессов.
+# Дерево надёжнее каталога: оно не зависит от того, откуда сессию запустили.
+owner_pid_from_tree() {
+  local pid=$$ depth=0
+  while (( depth < 24 )) && [[ -r "/proc/$pid/status" ]]; do
+    if [[ "$(cat "/proc/$pid/comm" 2>/dev/null)" == claude ]]; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+    pid="$(awk '/^PPid:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || return 1
+    (( depth += 1 ))
+  done
+  return 1
+}
+
+# sessionId сессии по pid её процесса — по нему сторож потом её и узнаёт.
+sid_of_pid() {
+  claude agents --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
 except Exception:
     rows = []
-rows.sort(key=lambda r: r.get("startedAt") or 0, reverse=True)
 for r in rows:
-    print("|".join(str(r.get(k, "")) for k in ("kind", "pid", "sessionId", "status", "startedAt", "name")))
-' "$DIR" 2>/dev/null || true
+    if str(r.get("pid")) == sys.argv[1]:
+        print(r.get("sessionId") or "")
+        break
+' "$1" 2>/dev/null || true
 }
 
 limits() {
@@ -200,6 +258,27 @@ if last_error:
     broke = datetime.fromisoformat(last_error.replace("Z", "+00:00")).timestamp()
     print(int(time.time() - broke))
 ' "$file" 2>/dev/null || true
+}
+
+# С каким контекстом поднимать работу: сессию каталога помним в resume_sid,
+# а если работу вела хозяйка из другого каталога — пробуем её журнал. Не подойдёт
+# (он принадлежит другому проекту) — start_session сама начнёт по PLAN.md.
+resume_target() {
+  local sid
+  sid="$(state_get resume_sid)"
+  [[ -n "$sid" ]] || sid="$(state_get owner_sid)"
+  printf '%s\n' "$sid"
+}
+
+# Оборвалась ли охраняемая работа — сессия каталога или хозяйка.
+work_broke() {
+  local sid broke
+  for sid in "$(state_get resume_sid)" "$(state_get owner_sid)"; do
+    [[ -n "$sid" ]] || continue
+    broke="$(session_broke "$sid")"
+    [[ "$broke" =~ ^[0-9]+$ ]] && { printf '%s\n' "$broke"; return 0; }
+  done
+  return 0
 }
 
 # Связь есть, если api.anthropic.com отвечает хоть чем-нибудь (адрес переопределяется
@@ -431,10 +510,18 @@ for r in rows:
 
 # Мягко закрыть то, что осталось от прежней сессии: две сессии в одном каталоге
 # правят одни и те же файлы.
+#
+# Сессию-хозяйку (она живёт в другом каталоге и попала в список лишь как признак
+# «работа идёт») закрываем только по явному требованию — `close_stalled owner`.
+# Это ветка подтверждённого обрыва: там она и есть та вставшая сессия, вместо
+# которой поднимают работу. Из-за молчания чужую сессию не трогаем: человек мог
+# вернуться и просто читать.
 close_stalled() {
-  local kind pid sid status started name closed=0
-  while IFS='|' read -r kind pid sid status started name; do
+  local with_owner="${1:-}"
+  local kind pid sid status started name own closed=0
+  while IFS='|' read -r kind pid sid status started name own; do
     [[ -z "$kind" ]] && continue
+    [[ -n "$own" && "$with_owner" != owner ]] && continue
     if [[ "$DRY" == 0 ]]; then
       if [[ "$kind" == background ]]; then
         claude stop "${sid:0:8}" >/dev/null 2>&1 || true
@@ -463,16 +550,18 @@ tick() {
     return 10
   fi
 
-  local watch_start hb kind pid sid status started name human=""
+  local watch_start hb kind pid sid status started name own human=""
   watch_start="$(state_num started)"
 
   # Своя сессия человека, заведённая уже при живом стороже: ночные `afk` зовёт
   # «afk-<каталог>», у ручных имя другое. Пока такая рядом, сторож не поднимает
   # ничего — но и не снимается: вкладку могут закрыть через минуту, а ночь
   # останется без присмотра.
-  while IFS='|' read -r kind pid sid status started name; do
+  while IFS='|' read -r kind pid sid status started name own; do
     [[ "$kind" == interactive ]] || continue
     [[ "$name" == afk-* ]] && continue
+    # Хозяйка — это и есть охраняемая работа, а не «своя сессия рядом».
+    [[ -n "$own" ]] && continue
     [[ "$started" =~ ^[0-9]+$ ]] || continue
     (( started / 1000 > watch_start + 60 )) && human="$name"
   done < <(sessions)
@@ -488,8 +577,10 @@ tick() {
     state_set paused 0
   fi
 
-  # Пока сессия на месте, помним её контекст: с ним же её и поднимать.
-  sid="$(sessions | head -1 | cut -d'|' -f3)"
+  # Пока сессия на месте, помним её контекст: с ним же её и поднимать. Хозяйку
+  # сюда не пишем — её журнал лежит в другом проекте, и `--resume` с ним в этом
+  # каталоге не откроется; она помнится отдельно, в owner_sid.
+  sid="$(sessions | awk -F'|' '$7 != "own"' | head -1 | cut -d'|' -f3)"
   [[ -n "$sid" && "$sid" != "$(state_get resume_sid)" ]] && state_set resume_sid "$sid"
 
   # Сессия занята работой — трогать её нельзя, что бы ни говорил heartbeat.
@@ -505,7 +596,7 @@ tick() {
   # Явный обрыв виднее молчания: клиенту дают пять минут на свои повторы,
   # дальше сессия уже точно никуда не поедет.
   local broke
-  broke="$(session_broke "$(state_get resume_sid)")"
+  broke="$(work_broke)"
   if [[ "$broke" =~ ^[0-9]+$ ]] && (( broke > 300 )); then
     if online; then
       # Разбудить в своём окне лучше, чем закрыть и поднять заново: остаются
@@ -517,8 +608,8 @@ tick() {
         return 0
       fi
       log "сессия оборвалась $(( broke / 60 )) мин назад (обрыв связи в журнале сессии) — поднимаю"
-      close_stalled
-      start_session "$(state_get resume_sid)" "оборвалась связь" || true
+      close_stalled owner
+      start_session "$(resume_target)" "оборвалась связь" || true
       return 0
     fi
     log "сессия оборвалась, но связи всё ещё нет — жду"
@@ -534,8 +625,15 @@ tick() {
   hb_at=$(stat -c %Y "$AFKDIR/heartbeat" 2>/dev/null || echo 0)
   if (( hb_at <= watch_start )); then
     if [[ -z "$(sessions)" ]]; then
+      # `afk` ставит сторожа раньше, чем запускает Claude Code: первые секунды
+      # пустой список означает не пропажу работы, а то, что она ещё заводится.
+      if (( $(now) - watch_start < START_GRACE )); then
+        say "сессии пока нет — жду ещё $(( START_GRACE - $(now) + watch_start )) с"
+        SLEEP=30
+        return 0
+      fi
       log "сессии в каталоге не осталось — поднимаю работу"
-      start_session "$(state_get resume_sid)" "сессия исчезла" || true
+      start_session "$(resume_target)" "сессия исчезла" || true
       return 0
     fi
     say "ночного пульса нет — слежу только за обрывами"
@@ -552,6 +650,16 @@ tick() {
   if ! online; then
     log "связи нет — жду, работу не трогаю"
     SLEEP=120
+    return 0
+  fi
+
+  # Работу ведёт живая сессия-хозяйка, и окна tmux у неё нет: написать ей нечем,
+  # а закрывать чужую сессию из-за молчания нельзя — человек мог вернуться и
+  # просто читать. Настоящий обрыв ловится выше, по журналу сессии.
+  local rows
+  rows="$(sessions)"
+  if [[ -n "$rows" && -z "$(awk -F'|' '$7 != "own"' <<< "$rows")" ]]; then
+    say "работу ведёт сессия человека «$(cut -d'|' -f6 <<< "$rows" | head -1)» — молчание не повод вмешиваться"
     return 0
   fi
 
@@ -623,7 +731,7 @@ tick() {
   fi
 
   close_stalled
-  start_session "$(state_get resume_sid)" "$why" || true
+  start_session "$(resume_target)" "$why" || true
   state_set hit_limit ""
   return 0
 }
@@ -682,7 +790,21 @@ case "$ACTION" in
     state_set resumes 0
     state_set last_resume 0
     state_set hit_limit ""
-    state_set resume_sid "$(sessions | head -1 | cut -d'|' -f3)"
+
+    # Кто ведёт работу: сессия, из которой сторожа позвали. Ищем её сейчас, пока
+    # `--start` выполняется внутри неё, — из юнита предки уже не те.
+    OWNER_PID="$(owner_pid_from_tree || true)"
+    OWNER_SID=""
+    [[ -n "$OWNER_PID" ]] && OWNER_SID="$(sid_of_pid "$OWNER_PID")"
+    state_set owner_pid "$OWNER_PID"
+    state_set owner_sid "$OWNER_SID"
+    if [[ -n "$OWNER_SID" ]]; then
+      say "работу ведёт сессия ${OWNER_SID:0:8} (pid $OWNER_PID) — её сторож и стережёт, из какого бы каталога её ни запустили"
+    else
+      say "сессии-хозяйки не видно: сторож поставлен не из Claude Code — работой считаю сессии в $DIR"
+    fi
+
+    state_set resume_sid "$(sessions | awk -F'|' '$7 != "own"' | head -1 | cut -d'|' -f3)"
 
     # Служебные файлы сторожа не должны попадать в ночные коммиты.
     if [[ -d "$DIR/.git" ]] && ! grep -qs '^\.afk/$' "$DIR/.git/info/exclude"; then
@@ -716,9 +838,13 @@ case "$ACTION" in
     else
       say "сторожа нет (юнит $UNIT не запущен)"
     fi
+    owner_sid="$(state_get owner_sid)"
+    if [[ -n "$owner_sid" ]]; then
+      say "работу ведёт сессия ${owner_sid:0:8} (pid $(state_get owner_pid))"
+    fi
     hb=$(age_of "$AFKDIR/heartbeat")
     if (( hb == 999999 )); then say "heartbeat не появлялся"; else say "последний виток $(( hb / 60 )) мин назад"; fi
-    broke="$(session_broke "$(state_get resume_sid)")"
+    broke="$(work_broke)"
     [[ "$broke" =~ ^[0-9]+$ ]] && say "сессия оборвана $(( broke / 60 )) мин назад и с тех пор молчит"
     resumes="$(state_num resumes)"
     (( resumes > 0 )) && say "работа поднималась заново $resumes раз"
